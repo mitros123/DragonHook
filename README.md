@@ -1,10 +1,10 @@
 ## DragonHook
 
-DragonHook is a Ghidra plugin that tries to integrate the information inside the GhidraDB with the dynamic capabilities of Frida.
-On the one hand, it exposes several useful functionalities of the GhidraDB (such as querying information on functions, updating with comments and dynamically inferenced references etc). This is ultimately available to Frida, live, through JavaScript function calls.
-On the other hand, it provides a handy interface to easily invoke Frida with a couple of clicks, so that the interaction with the GhidraDB is seamless.
+DragonHook is a Ghidra plugin that tries to integrate the information inside the GhidraDB with the dynamic capabilities of Frida.  
+On the one hand, it exposes several useful functionalities of the GhidraDB (such as querying information on functions, updating with comments and dynamically inferenced references etc). This is ultimately available to Frida, live, through JavaScript function calls.  
+On the other hand, it provides a handy interface to easily invoke Frida with a couple of clicks, so that the interaction with the GhidraDB is seamless.  
 
-An example video which showcases how dynamic call targets can be resolved live and updated inside GhidraDB is provided [in this link](https://youtu.be/lmWZHO_q5VI).
+An example video which showcases how dynamic call targets can be resolved live and updated inside GhidraDB is provided [in this link](https://youtu.be/lmWZHO_q5VI).  
 The result of the dynamic call resolution is an update with a comment and an xref, inside the GhidraDB:
 
 ![result_of_dynamic_call_stalking](images/result_of_dynamic_call_stalking.png)
@@ -43,6 +43,7 @@ pip install frida requests
 - Right click, and select "DragonHook Run Agent!". This should invoke a python script that will launch Frida with the predefined options.
 
 The configuration options can be seen under the section "Configuration Options", and the spawned menu offers the following functionalities:
+
 ![menu options](images/selection_options_menu.png)
 
 #### Example Workflow:
@@ -59,12 +60,12 @@ In this case, let's assume that we want to resolve all the dynamic calls of the 
 
 #### Architecture:
 
-Ghidra spawns an HTTP server at localhost:8124 by default. When the Agent is run, a python process is created that launches Frida with the predefined options. At any time Frida wants to read or write to the GhidraDB, it sends the related information to python which queries the HTTP API. Then, the result is returned back to Frida.
-The python script can be altered with a right click ->  DragonHook Config... -> Edit python invoker script.
-The configuration file is a JSON that can be altered with a right click ->  DragonHook Config... -> Edit config.
-The JavaScript file that is run by Frida is the Agent, and it can be altered with a right click ->  DragonHook Config... -> Edit agent script.
-In all the three cases, these files are opened with the default editor as configured in the OS.
-The application also redirects the standard output / standard error in specific files, whose locations are printed in the Console Window (they vary by Operating System).
+Ghidra spawns an HTTP server at localhost:8124 by default. When the Agent is run, a python process is created that launches Frida with the predefined options. At any time Frida wants to read or write to the GhidraDB, it sends the related information to python which queries the HTTP API. Then, the result is returned back to Frida.  
+The python script can be altered with a right click ->  DragonHook Config... -> Edit python invoker script.  
+The configuration file is a JSON that can be altered with a right click ->  DragonHook Config... -> Edit config.  
+The JavaScript file that is run by Frida is the Agent, and it can be altered with a right click ->  DragonHook Config... -> Edit agent script.  
+In all the three cases, these files are opened with the default editor as configured in the OS.  
+The application also redirects the standard output / standard error in specific files, whose locations are printed in the Console Window (they vary by Operating System).  
 
 
 #### Configuration Options:
