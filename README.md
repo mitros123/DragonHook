@@ -94,7 +94,7 @@ Some comments on them:
 - SPAWN_PROCESS_FROM_FRIDA is mostly self-explanatory. If it is set to true, PID_OF_PROCESS_TO_ATTACH is ignored.
 - PATH_OF_PROCESS_TO_HOOK is only used when SPAWN_PROCESS_FROM_FRIDA is true. In case of a mobile application, provide its name because it will effectively be passed to Frida's "-f" parameter.
 - PID_OF_PROCESS_TO_ATTACH is only used when SPAWN_PROCESS_FROM_FRIDA is false. A string value is accepted, it is later converted to integer.
-- DEVICE_ID_OF_DEVICE_TO_ATTACH_TO: The standard accepted values are "LOCAL", "USB" or "REMOTE-<IP>-<PORT>" (the default Frida Server port is 27042). For any other type of value, the entry is treated as a device ID and frida.get_device() is called on it.
+- DEVICE_ID_OF_DEVICE_TO_ATTACH_TO: The standard accepted values are "LOCAL", "USB" or "REMOTE\-\<IP\>\-\<PORT\>" (the default Frida Server port is 27042). For any other type of value, the entry is treated as a device ID and frida.get_device() is called on it.
 - PATH_OF_PYTHON_BINARY: The full path may be required, especially on Windows.
 - The DOS-related values affect the way Ghidra serves the various API endpoints. This is because the binary instrumented by Frida should be considered malicious, and can exhaust the server's resources. The configured Frida script also generally avoids to make redundant API calls, but these DOS values affect the Ghidra HTTP server.
 
