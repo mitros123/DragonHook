@@ -2,19 +2,13 @@ package dragonhook.tasks.watchpoint_processing;
 
 import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.LinkedList;
 
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.CodeUnit;
-import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
-import ghidra.program.model.symbol.Reference;
-import ghidra.program.model.symbol.ReferenceManager;
-import ghidra.program.model.symbol.Symbol;
-import ghidra.program.model.symbol.SymbolTable;
 import ghidra.util.task.TaskMonitor;
 
 public class WatchpointProcessingUtils {
@@ -83,26 +77,54 @@ public class WatchpointProcessingUtils {
     
     
         
+    //Hardware watchpoints only accept a size of 1, 2, 4 or 8 bytes, and the address has to be
+    //aligned to that size. A code unit length is neither: an x86 instruction is 1 to 15 bytes and a
+    //data item can be any length, so passing it straight through made setHardwareWatchpoint() throw
+    //for most selections, which the agent then reported as "hardware watchpoints not supported".
+    //Module bases are page aligned, so alignment of the offset carries over to the runtime address.
+    //An 8 byte watchpoint only exists on 64 bit targets: on 32 bit x86 the DR7 LEN field has no
+    //encoding for it, so max_size has to come from the program's pointer size.
+    public static int return_largest_valid_watchpoint_size(long offset_from_image_base, int length_of_codeunit, int max_size)
+    {
+        int[] candidate_sizes={8,4,2,1};
+        for (int i=0;i<candidate_sizes.length;i++)
+        {
+            int candidate_size=candidate_sizes[i];
+            if (candidate_size<=max_size && length_of_codeunit>=candidate_size
+                && Math.floorMod(offset_from_image_base,candidate_size)==0)
+            {
+                return candidate_size;
+            }
+        }
+        return 1;
+    }
+
+
     //[{"address_offset_as_num":0xffffffffffff,"size":4,"operation":"r"}]
     public static String return_all_watchpoint_info_objects_as_js_array(ArrayList<CodeUnit> incoming_list, Program current_program, String operation)
     {
         String retval="[";
         StringBuilder sb= new StringBuilder();
+        long image_base_offset=current_program.getImageBase().getOffset();
+        //8 byte watchpoints exist on 64 bit targets only
+        int max_watchpoint_size=(current_program.getDefaultPointerSize()>=8) ? 8 : 4;
         for (int i=0;i<incoming_list.size();i++)
         {
-            CodeUnit codeunit_in_question=incoming_list.get(i); 
+            CodeUnit codeunit_in_question=incoming_list.get(i);
             int length_of_codeunit=codeunit_in_question.getLength();
+            long offset_as_long=codeunit_in_question.getMinAddress().getOffset() - image_base_offset;
             String offset_as_str=return_offset_for_addr( codeunit_in_question.getMinAddress(),current_program);
-            sb.append("{\"address_offset_as_num\":"+offset_as_str+",\"size\":"+length_of_codeunit+",\"operation\":\""+operation+"\"}");
+            int size_for_watchpoint=return_largest_valid_watchpoint_size(offset_as_long,length_of_codeunit,max_watchpoint_size);
+            sb.append("{\"address_offset_as_num\":"+offset_as_str+",\"size\":"+size_for_watchpoint+",\"operation\":\""+operation+"\"}");
             if (i<incoming_list.size()-1)
             {
                 sb.append(",");
             }
         }
-        
-        retval+=sb.toString();
+
+        retval+=sb.toString(); 
         retval+="];";
-        return retval;
+        return retval;  
     }
     
 }

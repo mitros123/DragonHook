@@ -1,13 +1,7 @@
 package dragonhook;
 
 import java.util.ArrayList;
-import java.util.Map;
-import java.util.Properties;
 
-import dragonhook.tasks.dynamic_call_tracing.DynamicCallTracingUtils;
-import dragonhook.util.ConsolePrinter;
-import dragonhook.util.CreatorOfNecessaryFiles;
-import dragonhook.util.JSAgentPreparer;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Program;

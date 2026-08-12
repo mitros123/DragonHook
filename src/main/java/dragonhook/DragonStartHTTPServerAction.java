@@ -3,8 +3,9 @@ package dragonhook;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.Map;
+
+import com.sun.net.httpserver.HttpServer;
 
 import docking.ActionContext;
 import docking.action.DockingAction;
@@ -18,13 +19,8 @@ import dragonhook.util.JSAgentPreparer;
 import ghidra.app.services.ProgramManager;
 import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginTool;
-import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Program;
 import ghidra.program.util.ProgramSelection;
-import ghidra.framework.options.Options;
-
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpServer;
 
 public class DragonStartHTTPServerAction extends DockingAction {
 

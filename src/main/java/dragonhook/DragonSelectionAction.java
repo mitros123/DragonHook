@@ -1,24 +1,14 @@
 package dragonhook;
 
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.Properties;
-
 import docking.ActionContext;
 import docking.action.DockingAction;
 import docking.action.MenuData;
 import dragonhook.util.CreatorOfNecessaryFiles;
 import dragonhook.util.JSAgentPreparer;
-import ghidra.app.context.ListingActionContext;
-import ghidra.app.context.ListingContextAction;
 import ghidra.app.plugin.ProgramPlugin;
 import ghidra.app.services.ProgramManager;
 import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginTool;
-import ghidra.program.model.address.Address;
-import ghidra.program.model.listing.CodeUnit;
-import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.program.util.ProgramSelection;
 

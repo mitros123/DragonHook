@@ -7,7 +7,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
 
-import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.Program;
 
 public class JSAgentPreparer {
@@ -88,6 +87,29 @@ public class JSAgentPreparer {
 
     }
     
+    //lets the custom backtracer answer "did a computed call bring us here" from a baked in table,
+    //instead of asking ghidra at runtime and blocking the hooked thread until the reply arrives
+    public static void enable_precomputed_offsets_after_computed_calls(String dictionary_with_offsets_as_str)
+    {
+        change_specific_line_in_agent_file("var offsets_right_after_a_computed_call=",
+                "var offsets_right_after_a_computed_call="+dictionary_with_offsets_as_str+";",
+                true);
+        change_specific_line_in_agent_file("var precomputed_offsets_after_computed_calls_are_available=",
+                "var precomputed_offsets_after_computed_calls_are_available=true; // UPDATED FROM DRAGONHOOK PLUGIN",
+                true);
+    }
+
+    //When only our own module is stalked, every other module is excluded from Stalker. That is much
+    //cheaper, but code executing in another module is then run natively, so nothing it does is observed
+    //and a dynamic call into it resolves to the return continuation instead of the callee.
+    public static void set_whether_only_our_module_is_stalked(boolean only_our_module_is_stalked)
+    {
+        change_specific_line_in_agent_file("var stalker_exclude_everything_except_our_module=",
+                "var stalker_exclude_everything_except_our_module="
+                +(only_our_module_is_stalked ? "true" : "false")
+                +"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+    }
+
     public static void set_name_of_threads_to_be_stalked(String str_that_must_be_included_in_thread_names)
     {
         change_specific_line_in_agent_file("var there_is_a_restriction_for_the_thread_name_for_stalker=",
@@ -148,6 +170,36 @@ public class JSAgentPreparer {
 
 
     
+    public static void enable_string_reference_resolution(String js_object_with_strings_to_resolve,
+                                                         String max_times_to_log_each_reference,
+                                                         boolean also_instrument_register_based_memory_accesses)
+    {
+        change_specific_line_in_agent_file("var string_reference_resolution_is_enabled=",
+                "var string_reference_resolution_is_enabled=true; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+        change_specific_line_in_agent_file("var strings_to_resolve_compact=",
+                "var strings_to_resolve_compact="+js_object_with_strings_to_resolve+";", true);
+        change_specific_line_in_agent_file("var max_times_to_log_each_string_reference=",
+                "var max_times_to_log_each_string_reference="+max_times_to_log_each_reference+"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+        change_specific_line_in_agent_file("var also_instrument_register_based_memory_accesses=",
+                "var also_instrument_register_based_memory_accesses="
+                +(also_instrument_register_based_memory_accesses ? "true" : "false")
+                +"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+
+        //the string table only becomes usable once the module base is known
+        change_specific_line_in_agent_file("//DRAGONHOOK CODE GOES HERE, DO NOT REMOVE THIS LINE",
+                "//DRAGONHOOK CODE GOES HERE, DO NOT REMOVE THIS LINE\n    begin_stalking_as_soon_as_module_is_found();", true);
+    }
+
+
+    //"0" keeps the register based tier on for the whole session
+    public static void set_seconds_before_register_based_string_instrumentation_is_dropped(String seconds)
+    {
+        change_specific_line_in_agent_file("var seconds_before_register_based_instrumentation_is_dropped=",
+                "var seconds_before_register_based_instrumentation_is_dropped="+seconds
+                +"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+    }
+
+
     public static void enable_call_tracing_through_stalker(boolean only_include_functions_in_our_own_module)
     {
         change_specific_line_in_agent_file("var call_tracing_through_stalker_is_enabled=",

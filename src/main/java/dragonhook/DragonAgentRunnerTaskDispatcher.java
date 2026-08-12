@@ -1,11 +1,6 @@
 package dragonhook;
 
-import java.util.ArrayList;
-import java.util.Map;
-import java.util.Properties;
-
 import ghidra.framework.plugintool.PluginTool;
-import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Program;
 import ghidra.program.util.ProgramSelection;
 

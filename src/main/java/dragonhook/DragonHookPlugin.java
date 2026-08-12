@@ -15,28 +15,15 @@
  */
 package dragonhook;
 
-import java.awt.BorderLayout;
-
-import javax.swing.*;
-
-import docking.ActionContext;
-import docking.ComponentProvider;
-import docking.action.DockingAction;
-import docking.action.MenuData;
-import docking.action.ToolBarData;
 import dragonhook.util.CreatorOfNecessaryFiles;
 import ghidra.MiscellaneousPluginPackage;
-import ghidra.app.ExamplesPluginPackage;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.plugin.ProgramPlugin;
 import ghidra.app.services.ProgramManager;
-import ghidra.framework.options.Options;
-import ghidra.framework.plugintool.*;
+import ghidra.framework.plugintool.PluginInfo;
+import ghidra.framework.plugintool.PluginTool;
 import ghidra.framework.plugintool.util.PluginStatus;
 import ghidra.program.model.listing.Program;
-import ghidra.util.HelpLocation;
-import ghidra.util.Msg;
-import resources.Icons;
 
 /**
  * Provide class-level documentation that describes what this plugin does.
@@ -63,7 +50,7 @@ public class DragonHookPlugin extends ProgramPlugin {
     public DragonResetDOSLimitsAction resetDOSlimitsAction;
     public DragonStartHTTPServerAction startHTTPServerAction;
     public DragonStopHTTPServerAction stopHTTPServerAction;
-    public static String  DragonHook_plugin_version="0.1.0";
+    public static String  DragonHook_plugin_version="0.1.5";
 
 
     /**

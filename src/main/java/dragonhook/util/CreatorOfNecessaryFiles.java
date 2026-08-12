@@ -11,7 +11,6 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Map;
 
 import dragonhook.DragonHookPlugin;
 import generic.jar.ResourceFile;
@@ -75,6 +74,13 @@ public class CreatorOfNecessaryFiles {
     {
         String retval="";
         InputStream inputStream =CreatorOfNecessaryFiles.class.getResourceAsStream(resourcepath);
+        if (inputStream==null)
+        {
+            //used to be a NullPointerException here. Now that the agent is assembled from several
+            //resources, a renamed or unpackaged module is a realistic mistake and has to be reported.
+            System.out.println("DragonHook: resource not found in the extension: "+resourcepath);
+            return retval;
+        }
         String file_text="";
         try {
             file_text = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
@@ -113,6 +119,15 @@ public class CreatorOfNecessaryFiles {
         } catch (IOException e) {
             e.printStackTrace();
         } // if file already exists will do nothing
+
+        //A file that exists but is empty counts as missing. Without this, one failed assembly (a
+        //renamed or unpackaged agent module, for instance) would leave a zero byte agent behind that
+        //is never rewritten, and every later run would silently load nothing.
+        if (fileexists && file.length()==0)
+        {
+            fileexists=false;
+        }
+
         if (!fileexists)
         {
             try {
@@ -147,9 +162,92 @@ public class CreatorOfNecessaryFiles {
         return path_for_config_as_str;
     }
     
+    //The agent is kept as separate modules so that it can be worked on in pieces, and they are
+    //concatenated into the single file that the python invoker loads and that JSAgentPreparer patches.
+    //
+    //THE ORDER OF THIS ARRAY IS PART OF THE AGENT'S CORRECTNESS, it is not cosmetic:
+    // - function declarations hoist across the whole assembled script, so their order is free, but
+    //   "var" initialisers and top level statements run in file order
+    // - 01 must come first: its first line is the one JSAgentPreparer rewrites with the module name
+    //   and the ghidra image base, and the console.log override has to exist before anything logs
+    // - 05 reads ghidra_base_of_module_to_hook and module_name_to_hook at declaration time, so it
+    //   must follow 01
+    // - 08 holds the "PREPARATION STEPS" marker, the top level block that sets
+    //   is_generally_stalking_enabled, and the module/thread observers. Everything it reads must be
+    //   declared before it, and the observers must be registered after the preparation steps
+    // - 09 holds intercept_identified_module_DragonHook() with the "DRAGONHOOK CODE GOES HERE" marker
+    //   and rpc.exports, and must come last
+    public static String[] agent_module_files_in_order = {
+            "01_header_and_python_interaction.js",
+            "02_ghidra_api.js",
+            "03_function_and_address_info.js",
+            "04_custom_backtracer.js",
+            "05_dynamic_call_stalking.js",
+            "06_string_reference_resolution.js",
+            "07_hardware_watchpoints.js",
+            "08_preparation_and_observers.js",
+            "09_interceptors_and_rpc_exports.js"
+    };
+
+    //Always concatenates EVERY module in agent_module_files_in_order, unconditionally. There is no
+    //notion of "only the modules this run needs": the features are switched on by the flags that
+    //JSAgentPreparer patches, and those flags live inside the modules, so all of them must be present.
+    //
+    //If any single module is missing or empty the whole thing returns "", so that nothing is written
+    //and the empty file guard in create_file_in_local_settings_dir() retries next time. Appending a
+    //partial agent would cache a file that parses but silently lacks whole features.
+    public static String assemble_agent_from_modules()
+    {
+        StringBuilder sb=new StringBuilder(131072);
+        boolean a_module_is_missing=false;
+        for (int i=0;i<agent_module_files_in_order.length;i++)
+        {
+            String contents_of_module=read_text_from_resource(
+                    "/script_templates/agent_modules/"+agent_module_files_in_order[i]);
+            if (contents_of_module==null || contents_of_module.isEmpty())
+            {
+                System.out.println("DragonHook: agent module "+agent_module_files_in_order[i]
+                        +" is missing or empty, refusing to assemble a partial agent");
+                a_module_is_missing=true;
+                continue;   //keep going so that every missing module gets reported, not just the first
+            }
+            sb.append(contents_of_module);
+        }
+        if (a_module_is_missing)
+        {
+            System.out.println("DragonHook: the agent was NOT assembled. Rebuild and reinstall the"
+                    +" extension, and make sure every file listed in agent_module_files_in_order is"
+                    +" packaged under /script_templates/agent_modules/");
+            return "";
+        }
+        return sb.toString();
+    }
+
+    //Same rule create_file_in_local_settings_dir() applies: a file that is absent or zero length has
+    //to be produced, anything else is left alone so that a user's manual edits survive.
+    public static boolean does_file_in_local_settings_dir_need_creating(String filename)
+    {
+        Path path_for_file=CreatorOfNecessaryFiles.get_dir_for_DragonhookPlugin_files().resolve(filename);
+        File file = path_for_file.toFile();
+        return ( (!file.exists()) || file.length()==0 );
+    }
+
+    //Only writes when the file does not already exist, which is what keeps a user's manual edits to
+    //the assembled agent from being thrown away.
+    //
+    //The existence check happens BEFORE assembling on purpose. Almost every menu action calls
+    //createAllNecessaryFiles(), and several call createAgentFile() again right after, so assembling
+    //first meant reading nine resources and building a ~110 KB string several times per action only to
+    //throw it away because the file was already there. It also meant the "module missing" diagnostic
+    //fired on every single action instead of only when the agent is actually being produced.
     public static String createAgentFile()
     {
-        initial_value_for_agent=read_text_from_resource("/script_templates/"+agent_file_name);
+        Path path_for_agent=CreatorOfNecessaryFiles.get_dir_for_DragonhookPlugin_files().resolve(agent_file_name);
+        if (!does_file_in_local_settings_dir_need_creating(agent_file_name))
+        {
+            return path_for_agent.toString();
+        }
+        initial_value_for_agent=assemble_agent_from_modules();
         String path_for_agent_as_str= create_file_in_local_settings_dir(agent_file_name,initial_value_for_agent);
         return path_for_agent_as_str;
     }

@@ -12,68 +12,73 @@ import java.util.Map;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 
-import ghidra.program.model.listing.CodeUnit;
-
 public class HttpUtils {
 
     public static long badlong=-567824390162L;
     public static String badstring="badstring, what a pity";
     public static byte[] badbytes= new byte[0];
 
-    
+    //Hard cap on the request body we are willing to buffer. The largest legitimate body is a
+    //CHANGE_BYTES_INSIDE_GHIDRADB payload: 20 MB of raw bytes -> ~26.7 MB of base64 -> ~29 MB once
+    //form-encoded, so 64 MB leaves plenty of headroom while bounding what a hostile client can make
+    //Ghidra allocate. Without a cap, readAllBytes() will happily buffer whatever is sent.
+    public static int max_POST_body_size=64*1024*1024;
+
+
+    //splits one "key=value" pair and stores it. The value may itself contain '=' (base64 padding,
+    //for instance), so the split is limited to 2 parts instead of dropping the whole parameter.
+    private static void parse_and_store_one_param(String param_kv, Map<String, String> retval)
+    {
+        String[] arr_with_kv_split = param_kv.split("=", 2);
+        if (arr_with_kv_split.length == 2)
+        {
+            try
+            {
+                String param = URLDecoder.decode(arr_with_kv_split[0], StandardCharsets.UTF_8);
+                String value = URLDecoder.decode(arr_with_kv_split[1], StandardCharsets.UTF_8);
+                retval.put(param, value);
+            } catch (Exception e) {
+                System.out.println("Error in parameter decode "+param_kv+" "+ e);
+            }
+        }
+    }
+
+
     public static Map<String, String> parse_GET_params(HttpExchange httpexchange)
     {
         Map<String, String> retval = new HashMap<>();
         String GET_params_as_str=httpexchange.getRequestURI().getQuery(); // after the ? part
-        if (GET_params_as_str != null) 
+        if (GET_params_as_str != null)
         {
             String[] param_kvs = GET_params_as_str.split("&");
             for (int i=0; i<param_kvs.length; i++)
             {
-                String param_kv=param_kvs[i];
-                String[] arr_with_kv_split = param_kv.split("=");
-                if (arr_with_kv_split.length == 2)
-                {
-                    try 
-                    {
-                        String param = URLDecoder.decode(arr_with_kv_split[0], StandardCharsets.UTF_8);
-                        String value = URLDecoder.decode(arr_with_kv_split[1], StandardCharsets.UTF_8);
-                        retval.put(param, value);
-                    } catch (Exception e) {
-                        System.out.println("Error in parameter decode "+arr_with_kv_split+" "+ e);
-                    }
-                }
-            } 
+                parse_and_store_one_param(param_kvs[i], retval);
+            }
         }
         return retval;
     }
-    
-    
+
+
     public static Map<String, String> parse_POST_params(HttpExchange httpexchange) throws IOException
     {
         Map<String, String> retval = new HashMap<>();
         InputStream body_inpstream=httpexchange.getRequestBody();
-        byte[] body_arr=body_inpstream.readAllBytes();
+        //read one byte more than the cap, so that we can tell "exactly at the cap" from "over it"
+        byte[] body_arr=body_inpstream.readNBytes(max_POST_body_size+1);
+        if (body_arr.length > max_POST_body_size)
+        {
+            System.out.println("Request body larger than the allowed "+max_POST_body_size+" bytes, ignoring it.");
+            return retval; //empty map, the endpoint will reply with its usual parameter error
+        }
         String body_as_str= new String(body_arr,StandardCharsets.UTF_8);
-        if (body_as_str != null && body_as_str!="") 
+        if (!body_as_str.isEmpty())
         {
             String[] param_kvs = body_as_str.split("&");
             for (int i=0; i<param_kvs.length; i++)
             {
-                String param_kv=param_kvs[i];
-                String[] arr_with_kv_split = param_kv.split("=");
-                if (arr_with_kv_split.length == 2)
-                {
-                    try 
-                    {
-                        String param = URLDecoder.decode(arr_with_kv_split[0], StandardCharsets.UTF_8);
-                        String value = URLDecoder.decode(arr_with_kv_split[1], StandardCharsets.UTF_8);
-                        retval.put(param, value);
-                    } catch (Exception e) {
-                        System.out.println("Error in parameter decode "+arr_with_kv_split+" "+ e);
-                    }
-                }
-            } 
+                parse_and_store_one_param(param_kvs[i], retval);
+            }
         }
         return retval;
     }
@@ -106,9 +111,13 @@ public class HttpUtils {
     public static long provide_safe_long_from_params(Map<String, String> extracted_param_map, String param_name)
     {
         long retval=badlong;
-        try 
+        try
         {
             String param_val_as_str=extracted_param_map.get(param_name);
+            if (param_val_as_str==null)
+            {
+                return badlong;
+            }
             if (param_val_as_str.startsWith("0x") || param_val_as_str.startsWith("0X"))
             {
                 param_val_as_str=param_val_as_str.substring(2); //remove 0x
@@ -125,12 +134,16 @@ public class HttpUtils {
         return retval;
     }
     
+    //NEVER returns null: a missing parameter yields badstring. Map.get() does not throw for a
+    //missing key, it returns null, so without this check the callers would NPE on .equals() and the
+    //endpoint would die without ever sending a reply.
     public static String provide_string_from_params(Map<String, String> extracted_param_map, String param_name)
     {
         String retval=badstring;
-        try 
+        try
         {
-            retval=extracted_param_map.get(param_name);
+            String value_from_map=extracted_param_map.get(param_name);
+            retval=(value_from_map==null) ? badstring : value_from_map;
         }
         catch (Exception e) {
             retval=badstring;

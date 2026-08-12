@@ -1,7 +1,6 @@
 package dragonhook;
 
-import java.io.IOException;
-import java.net.InetSocketAddress;
+import com.sun.net.httpserver.HttpServer;
 
 import docking.ActionContext;
 import docking.action.DockingAction;
@@ -14,8 +13,6 @@ import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
 import ghidra.program.util.ProgramSelection;
-import ghidra.framework.options.Options;
-import com.sun.net.httpserver.HttpServer;
 
 public class DragonStopHTTPServerAction extends DockingAction {
 

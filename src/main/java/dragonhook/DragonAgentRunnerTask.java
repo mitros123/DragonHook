@@ -2,19 +2,13 @@ package dragonhook;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.Map;
 
-import dragonhook.util.AddressRangeMinMaxContainer;
 import dragonhook.util.ConfigFileParser;
 import dragonhook.util.ConsolePrinter;
 import dragonhook.util.CreatorOfNecessaryFiles;
@@ -22,19 +16,10 @@ import dragonhook.util.DOSLimitsTracker;
 import generic.json.JSONParser;
 import generic.json.JSONToken;
 import ghidra.framework.plugintool.PluginTool;
-import ghidra.program.model.address.AddressRange;
-import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Program;
-import ghidra.program.util.ProgramSelection;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.Task;
 import ghidra.util.task.TaskMonitor;
-import java.io.StringReader;
-import java.lang.reflect.Type;
-import com.google.gson.*;
-import com.google.gson.reflect.TypeToken;
-import com.google.gson.stream.JsonReader;
-import java.io.Reader;
 
 public class DragonAgentRunnerTask extends Task {
 

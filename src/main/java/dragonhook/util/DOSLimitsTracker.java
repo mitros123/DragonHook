@@ -3,9 +3,7 @@ package dragonhook.util;
 import java.util.HashMap;
 import java.util.Map;
 
-import dragonhook.DragonStartHTTPServerAction;
 import ghidra.program.model.listing.CodeUnit;
-import ghidra.program.model.listing.Function;
 
 public class DOSLimitsTracker {
 

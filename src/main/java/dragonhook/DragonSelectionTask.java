@@ -1,25 +1,19 @@
 package dragonhook;
 
 import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.LinkedList;
 
 import dragonhook.tasks.custom_backtracer.CustomBacktracerUtils;
 import dragonhook.tasks.dynamic_call_tracing.DynamicCallTracingUtils;
+import dragonhook.tasks.string_reference_resolution.StringReferenceResolutionUtils;
 import dragonhook.tasks.watchpoint_processing.WatchpointProcessingUtils;
-import dragonhook.util.AddressRangeMinMaxContainer;
 import dragonhook.util.ConsolePrinter;
 import dragonhook.util.CreatorOfNecessaryFiles;
 import dragonhook.util.JSAgentPreparer;
 import dragonhook.util.PackageChecker;
 import ghidra.framework.plugintool.PluginTool;
-import ghidra.program.model.address.Address;
-import ghidra.program.model.address.AddressRange;
-import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.CodeUnit;
-import ghidra.program.model.listing.Listing;
+import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Program;
-import ghidra.program.util.ProgramSelection;
 import ghidra.util.exception.CancelledException;
 import ghidra.util.task.Task;
 import ghidra.util.task.TaskMonitor;
@@ -33,7 +27,12 @@ public class DragonSelectionTask extends Task {
     protected DragonSelectionAddressRangeGathererTask code_unit_gatherer_task;
     
     public DragonSelectionTask(String title, Program incoming_program, PluginTool tool,DragonSelectionOptionsDialog incoming_selection_options_dialog,DragonSelectionAddressRangeGathererTask code_unit_gatherer_task) {
-        super(title);
+        //Task(String title) means canCancel=false, so monitor.isCancelled() was permanently false and
+        //every isCancelled() check inside this task was dead, including the one in the whole program
+        //scan for the backtracer's computed call table. No progress bar on purpose: progress is
+        //reported as counts inside monitor.setMessage().
+        //Arguments are (title, canCancel, hasProgress, isModal).
+        super(title, true, false, true);
         this.current_program=incoming_program;
         this.incoming_plugintool=tool;
         this.is_cancelled=false;
@@ -112,6 +111,9 @@ public class DragonSelectionTask extends Task {
             
             
             JSAgentPreparer.set_number_of_logged_dynamic_calls((String) this.incoming_selection_options_dialog.MaxTimesToUpdateCodeUnitInGhidraDBComboBox.getSelectedItem());
+
+            JSAgentPreparer.set_whether_only_our_module_is_stalked(
+                    !this.incoming_selection_options_dialog.isDynCalls_StalkOtherModulesCheckBoxchecked);
             
             
         }
@@ -137,6 +139,9 @@ public class DragonSelectionTask extends Task {
             }
                         
             JSAgentPreparer.enable_call_tracing_through_stalker(!this.incoming_selection_options_dialog.isCallTraceOutsideOurModuleCheckBoxchecked);
+
+            JSAgentPreparer.set_whether_only_our_module_is_stalked(
+                    !this.incoming_selection_options_dialog.isCallTracing_StalkOtherModulesCheckBoxchecked);
             
             if (this.incoming_selection_options_dialog.isCallTracing_OnlyStalkThreadsWithNameCheckBoxchecked)
             {
@@ -154,9 +159,67 @@ public class DragonSelectionTask extends Task {
             monitor.cancel();
             return;
         }
-        
-        
-        
+
+
+
+        //Resolution of references to strings that ghidra sees as unreferenced
+        if (this.incoming_selection_options_dialog.isResolveStringsWithoutReferencesCheckBoxchecked)
+        {
+            ArrayList<Data> strings_to_resolve=
+                    StringReferenceResolutionUtils.extract_strings_from_selection(this.current_program,
+                            code_unit_gatherer_task.address_ranges_that_are_gathered, monitor,
+                            this.incoming_selection_options_dialog.isStringRefs_AlsoIncludeStringsWithReferencesCheckBoxchecked);
+
+            if (strings_to_resolve==null || monitor.isCancelled())
+            {
+                this.is_cancelled=true;
+                monitor.cancel();
+                return;
+            }
+
+            if (strings_to_resolve.size()==0)
+            {
+                cp.print_to_console("No strings were found in the selection, string reference resolution was not enabled."
+                        +" Select the strings whose references you want to resolve.");
+            }
+            else
+            {
+                String js_object_with_strings_to_resolve=
+                        StringReferenceResolutionUtils.return_selected_strings_as_js_object(strings_to_resolve,this.current_program);
+
+                JSAgentPreparer.enable_string_reference_resolution(
+                        js_object_with_strings_to_resolve,
+                        (String) this.incoming_selection_options_dialog.MaxTimesToLogEachStringReferenceComboBox.getSelectedItem(),
+                        this.incoming_selection_options_dialog.isStringRefs_AlsoInstrumentRegisterBasedAccessesCheckBoxchecked);
+
+                JSAgentPreparer.set_whether_only_our_module_is_stalked(
+                        !this.incoming_selection_options_dialog.isStringRefs_StalkOtherModulesCheckBoxchecked);
+
+                JSAgentPreparer.set_seconds_before_register_based_string_instrumentation_is_dropped(
+                        (String) this.incoming_selection_options_dialog.StringRefs_SecondsBeforeDroppingRegisterTierComboBox.getSelectedItem());
+
+                if (this.incoming_selection_options_dialog.isStringRefs_OnlyStalkThreadsWithNameCheckBoxchecked)
+                {
+                    String str_that_is_included_in_threadnames=
+                            incoming_selection_options_dialog.StringRefs_OnlyStalkThreadsWithNameTextField.getText();
+                    JSAgentPreparer.set_name_of_threads_to_be_stalked(str_that_is_included_in_threadnames);
+                }
+
+                cp.print_to_console("String reference resolution enabled for "+Integer.toString(strings_to_resolve.size())
+                        +" selected strings.");
+            }
+        }
+
+
+        if (monitor.isCancelled())
+        {
+            this.is_cancelled=true;
+            monitor.cancel();
+            return;
+        }
+
+
+
         if (this.incoming_selection_options_dialog.isSetHardwareWatchPointCheckBoxchecked)
         {
             
@@ -218,9 +281,26 @@ public class DragonSelectionTask extends Task {
         if (this.incoming_selection_options_dialog.isCustomBackTraceFromSelectedAddressesCheckBoxchecked
             && PackageChecker.isClassAvailable("fridahookgenerator.FridaHookGeneratorPlugin"))
         {
+            //Precompute the return addresses of every computed call in the program, so that the agent
+            //can decide whether a backtrace came through a computed call with a dictionary lookup.
+            //Without it the agent asks ghidra at runtime and blocks the hooked thread each time.
+            if (this.incoming_selection_options_dialog.isPrecomputeComputedCallReturnAddressesCheckBoxchecked)
+            {
+                String js_dict_with_offsets_after_computed_calls=
+                        DynamicCallTracingUtils.return_all_offsets_after_computed_calls_as_js_dict(this.current_program, monitor);
+
+                if (js_dict_with_offsets_after_computed_calls==null || monitor.isCancelled())
+                {
+                    this.is_cancelled=true;
+                    monitor.cancel();
+                    return;
+                }
+                JSAgentPreparer.enable_precomputed_offsets_after_computed_calls(js_dict_with_offsets_after_computed_calls);
+            }
+
             boolean we_are_using_regex=(this.incoming_selection_options_dialog.BacktraceFunctionsOrAddressesComboBox.getSelectedIndex()==2);
-            
-            
+
+
             String addresses_to_hook="";
             if (we_are_using_regex)
             {

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import json
 import threading
+import queue
 import requests
 import base64
 
@@ -16,6 +17,36 @@ DragonHook_config={}
 frida_script_contents=""
 dragonhook_config_dir_pathstr=""
 dragonhook_api_callword="DH_GHIDRA_API_CALL"
+
+#---------------------- WORKER POOL FOR THE GHIDRA HTTP CALLS ----------------------
+#frida delivers every message on a single reactor thread. Doing a blocking HTTP request there
+#serialises the whole pipeline: while one comment is being written to the Ghidra DB, no other
+#message from the agent can be processed, including the reply that a blocked recv().wait() in a
+#stalked thread is waiting for. So the reactor thread only enqueues, and these workers do the I/O.
+#
+#Updates are partitioned by target address so that two updates for the SAME address are still
+#applied in order, while updates for different addresses run in parallel.
+#Queries (the calls the agent actually blocks on) get their own queue so they can never end up
+#stuck behind a backlog of updates.
+number_of_update_workers=4
+max_queued_api_calls=100000            #backpressure: enqueueing blocks past this point
+query_api_calls={"FUN_DATA_GIVEN_ADDR_OFFSET",
+                 "ALL_FUN_DATA_SORTED_BY_RANGESTART",
+                 "CODEUNIT_DATA_GIVEN_ADDR_OFFSET"}
+query_queue=queue.Queue(maxsize=max_queued_api_calls)
+update_queues=[]
+worker_threads=[]
+thread_local_storage=threading.local()
+
+
+#one requests.Session per worker thread, so connections to the Ghidra HTTP server are kept alive
+#instead of being torn down and re-established for every single comment/xref
+def get_session():
+    existing_session=getattr(thread_local_storage,"http_session",None)
+    if existing_session is None:
+        existing_session=requests.Session()
+        thread_local_storage.http_session=existing_session
+    return existing_session
 
 
 #sys.stdout=open(sys.stdout.fileno(),mode='w',buffering=1)
@@ -33,33 +64,42 @@ def print(*args, **kwargs):
     return __builtin__.print(*args, **kwargs)
 
 
+def ghidra_server_url(endpoint):
+    return "http://"+DragonHook_config["GHIDRA_HTTP_SERVER_INTERFACE_IP"]+":"+DragonHook_config["GHIDRA_HTTP_SERVER_PORT"]+"/"+endpoint
+
+
 def return_function_data_given_address_offset(paramlist):
     value_of_param=paramlist[0]
-    response=requests.get("http://"+DragonHook_config["GHIDRA_HTTP_SERVER_INTERFACE_IP"]+":"+DragonHook_config["GHIDRA_HTTP_SERVER_PORT"]+"/FUN_DATA_GIVEN_ADDR_OFFSET",params={"address_offset":value_of_param})
+    response=get_session().get(ghidra_server_url("FUN_DATA_GIVEN_ADDR_OFFSET"),params={"address_offset":value_of_param})
     return response.text
 
 def return_codeunit_data_given_address_offset(paramlist):
     value_of_param=paramlist[0]
-    response=requests.get("http://"+DragonHook_config["GHIDRA_HTTP_SERVER_INTERFACE_IP"]+":"+DragonHook_config["GHIDRA_HTTP_SERVER_PORT"]+"/CODEUNIT_DATA_GIVEN_ADDR_OFFSET",params={"address_offset":value_of_param})
+    response=get_session().get(ghidra_server_url("CODEUNIT_DATA_GIVEN_ADDR_OFFSET"),params={"address_offset":value_of_param})
     return response.text
 
 
 def return_all_function_data_by_ranges(paramlist):
-    response=requests.get("http://"+DragonHook_config["GHIDRA_HTTP_SERVER_INTERFACE_IP"]+":"+DragonHook_config["GHIDRA_HTTP_SERVER_PORT"]+"/ALL_FUN_DATA_SORTED_BY_RANGESTART",params={},timeout=25)
+    #This one can legitimately take a long time on a big program: Ghidra has to walk every function
+    #and every function body range. A short timeout here used to abort the request, the exception
+    #escaped on_message(), no reply was ever posted, and the agent stayed blocked in recv().wait()
+    #for the rest of the session. Keep it generous, and see the try/except in run_api_call().
+    timeout_for_bulk_fetch=DragonHook_config.get("TIMEOUT_FOR_BULK_FUNCTION_DATA_FETCH",600)
+    response=get_session().get(ghidra_server_url("ALL_FUN_DATA_SORTED_BY_RANGESTART"),params={},timeout=timeout_for_bulk_fetch)
     print("text length:"+str(len(response.text)))
     return response.text
 
 def update_ghidradb_with_comment_at_addr(paramlist):
     address_offset=paramlist[0]
     comment_to_set=paramlist[1]
-    response=requests.post("http://"+DragonHook_config["GHIDRA_HTTP_SERVER_INTERFACE_IP"]+":"+DragonHook_config["GHIDRA_HTTP_SERVER_PORT"]+"/UPDATE_GHIDRADB_WITH_COMMENT_AT_ADDR",data={"address_offset":address_offset,"comment":comment_to_set})
+    response=get_session().post(ghidra_server_url("UPDATE_GHIDRADB_WITH_COMMENT_AT_ADDR"),data={"address_offset":address_offset,"comment":comment_to_set})
     return response.text
 
 def update_ghidradb_with_xref(paramlist):
     address_offset_from=paramlist[0]
     address_offset_to=paramlist[1]
     type_of_xref=paramlist[2]
-    response=requests.get("http://"+DragonHook_config["GHIDRA_HTTP_SERVER_INTERFACE_IP"]+":"+DragonHook_config["GHIDRA_HTTP_SERVER_PORT"]+"/UPDATE_GHIDRADB_WITH_XREF",params={"address_offset_from":address_offset_from,"address_offset_to":address_offset_to,"RefType":type_of_xref})
+    response=get_session().get(ghidra_server_url("UPDATE_GHIDRADB_WITH_XREF"),params={"address_offset_from":address_offset_from,"address_offset_to":address_offset_to,"RefType":type_of_xref})
     return response.text
 
 def update_bytes_in_ghidradb(paramlist):
@@ -71,7 +111,7 @@ def update_bytes_in_ghidradb(paramlist):
         b64_encoded=base64.b64encode(byte_data).decode('utf-8')
     except:
         return "Error from python, in decimalarray to base64 conversion"
-    response=requests.post("http://"+DragonHook_config["GHIDRA_HTTP_SERVER_INTERFACE_IP"]+":"+DragonHook_config["GHIDRA_HTTP_SERVER_PORT"]+"/CHANGE_BYTES_INSIDE_GHIDRADB",data={"address_offset":address_offset,"content_as_b64":b64_encoded})
+    response=get_session().post(ghidra_server_url("CHANGE_BYTES_INSIDE_GHIDRADB"),data={"address_offset":address_offset,"content_as_b64":b64_encoded})
     return response.text
 
 defined_dragonhook_api_calls={
@@ -116,6 +156,74 @@ def install_frida_dependencies():
     #result = pm.install(specs=["frida-itrace","frida-il2cpp-bridge","frida-stack"])
 
 
+def return_reply_type_for_api_call(fun_name,params):
+    if (fun_name=="UPDATE_GHIDRADB_WITH_COMMENT_AT_ADDR" or fun_name=="CHANGE_BYTES_INSIDE_GHIDRADB" ):
+        #in this case the entire comment will not be put inside the type
+        return "api-response-"+fun_name+"-['"+str(params[0])+"']"
+    return "api-response-"+fun_name+"-"+str(params)
+
+
+def run_api_call(fun_name,params):
+    print("Invoking DragonHook API call "+fun_name + " with paramlist: "+str(params))
+    #A reply MUST be posted on every path. The agent registers a recv() handler for every call and,
+    #depending on the *_are_asynchronous flags, may be blocked in recv().wait() on a stalked thread.
+    #If an exception escaped here the reply would never be sent and that thread would hang forever.
+    try:
+        returned_data_as_str=str(defined_dragonhook_api_calls[fun_name]["handler"](params))
+    except Exception as e:
+        returned_data_as_str="Error from python while invoking "+fun_name+": "+repr(e)
+        print(returned_data_as_str)
+    if (len(returned_data_as_str)>2000):
+        print("Sending data back to JS: "+returned_data_as_str[:2000]+".....")
+    else:
+        print("Sending data back to JS: "+returned_data_as_str)
+    try:
+        script.post({"type":return_reply_type_for_api_call(fun_name,params),"payload":returned_data_as_str})
+    except Exception as e:
+        print("Could not post the reply for "+fun_name+": "+repr(e))
+
+
+def api_call_worker(incoming_queue):
+    while True:
+        item=incoming_queue.get()
+        if item is None:        #shutdown sentinel
+            incoming_queue.task_done()
+            return
+        (fun_name,params)=item
+        try:
+            run_api_call(fun_name,params)
+        finally:
+            incoming_queue.task_done()
+
+
+def start_api_call_workers():
+    global update_queues
+    global worker_threads
+    update_queues=[queue.Queue(maxsize=max_queued_api_calls) for _ in range(number_of_update_workers)]
+    all_queues=[query_queue]+update_queues
+    for current_queue in all_queues:
+        worker=threading.Thread(target=api_call_worker,args=(current_queue,),daemon=True)
+        worker.start()
+        worker_threads.append(worker)
+
+
+def stop_api_call_workers():
+    for current_queue in [query_queue]+update_queues:
+        try:
+            current_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+
+def enqueue_api_call(fun_name,params):
+    if fun_name in query_api_calls:
+        query_queue.put((fun_name,params))
+        return
+    #updates: keep same-address updates on the same worker so they are applied in order
+    partition_key=str(params[0]) if len(params)>0 else ""
+    update_queues[hash(partition_key) % number_of_update_workers].put((fun_name,params))
+
+
 def on_message(message, data):
     if message['type'] == 'send':
         #print("[*] Message from script:", message['payload'])
@@ -129,19 +237,8 @@ def on_message(message, data):
                 if (fun_name,params)==(None,None):
                     pass
                 else:
-                    print("Invoking DragonHook API call "+fun_name + " with paramlist: "+str(params))
-                    #invoke the function
-                    returned_data_from_fun=defined_dragonhook_api_calls[fun_name]["handler"](params)
-                    returned_data_as_str=str(returned_data_from_fun)
-                    if (len(returned_data_as_str)>2000):
-                        print("Sending data back to JS: "+returned_data_as_str[:2000]+".....")
-                    else:
-                        print("Sending data back to JS: "+returned_data_as_str)
-                    if (fun_name=="UPDATE_GHIDRADB_WITH_COMMENT_AT_ADDR" or fun_name=="CHANGE_BYTES_INSIDE_GHIDRADB" ):
-                        #in this case the entire comment will not be put inside the type
-                        script.post({"type":"api-response-"+fun_name+"-['"+str(params[0])+"']","payload":returned_data_as_str})
-                    else:
-                        script.post({"type":"api-response-"+fun_name+"-"+str(params),"payload":returned_data_as_str})
+                    #do NOT do the HTTP call on frida's reactor thread, see the worker pool above
+                    enqueue_api_call(fun_name,params)
     elif message['type'] == 'error':
         print("[!] Script error:", message['stack'])
     else:
@@ -204,7 +301,10 @@ def start_hooking():
         
         
 
-        # Create and load the script
+        # Create and load the script.
+        # The workers must be running before load(), because the agent may issue a blocking
+        # API call (e.g. the bulk function data fetch) from its top-level code during load().
+        start_api_call_workers()
         script = session.create_script(frida_script_contents)
         script.on('message', on_message)
         script.load()
@@ -228,6 +328,8 @@ def start_hooking():
 
     except Exception as e:
         print("[!] Exception:", e)
+    finally:
+        stop_api_call_workers()
 
 
 if __name__ == "__main__":

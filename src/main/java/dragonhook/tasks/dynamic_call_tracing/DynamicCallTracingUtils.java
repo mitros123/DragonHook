@@ -2,13 +2,13 @@ package dragonhook.tasks.dynamic_call_tracing;
 
 import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.LinkedList;
 
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.CodeUnit;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.symbol.Reference;
@@ -113,6 +113,63 @@ public class DynamicCallTracingUtils {
         return retval;
     }
     
+    //Emits the offsets that immediately FOLLOW a computed call, that is the return addresses such a
+    //call pushes. A backtrace entry is exactly one of those, so with this table the agent answers
+    //"did a computed call bring us here" with a dictionary lookup instead of asking ghidra over IPC
+    //at runtime, which blocks the hooked thread for a full round trip on every hit.
+    //
+    //Scans the WHOLE program on purpose: a backtrace can point anywhere inside the module, not only
+    //at the user's selection.
+    //
+    //Returns null if the user cancelled.
+    public static String return_all_offsets_after_computed_calls_as_js_dict(Program current_program, TaskMonitor incoming_monitor)
+    {
+        long image_base_offset=current_program.getImageBase().getOffset();
+        Listing current_program_listing=current_program.getListing();
+        long total_number_of_instructions=current_program_listing.getNumInstructions();
+        long number_of_instructions_examined=0;
+        long number_of_computed_calls_found=0;
+
+        incoming_monitor.setMessage("Precomputing the return addresses of computed calls...");
+
+        StringBuilder sb=new StringBuilder();
+        sb.append("{");
+
+        InstructionIterator instruction_iterator=current_program_listing.getInstructions(true);
+        while (instruction_iterator!=null && instruction_iterator.hasNext())
+        {
+            Instruction current_instruction=instruction_iterator.next();
+            number_of_instructions_examined+=1;
+
+            if (number_of_instructions_examined % 10000 == 0)
+            {
+                if (incoming_monitor.isCancelled())
+                {
+                    incoming_monitor.cancel();
+                    System.out.println("Precomputation of the return addresses of computed calls is cancelled");
+                    return null;
+                }
+                incoming_monitor.setMessage("Precomputing the return addresses of computed calls ... "
+                        +Long.toString(number_of_instructions_examined)+"/"+Long.toString(total_number_of_instructions)
+                        +" , found "+Long.toString(number_of_computed_calls_found));
+            }
+
+            if (current_instruction.getFlowType().isCall() && current_instruction.getFlowType().isComputed())
+            {
+                long offset_right_after_the_call=current_instruction.getMinAddress().getOffset()
+                        + current_instruction.getLength() - image_base_offset;
+                sb.append("\""+"0x"+Long.toHexString(offset_right_after_the_call)+"\":true,");
+                number_of_computed_calls_found+=1;
+            }
+        }
+
+        sb.append("\"0xffffffffffff\":true}"); //dummy entry, so that the trailing comma above stays valid
+        System.out.println("Precomputed "+Long.toString(number_of_computed_calls_found)
+                +" computed call return addresses, after examining "+Long.toString(number_of_instructions_examined)+" instructions");
+        return sb.toString();
+    }
+
+
     public static String return_all_offsets_of_dynamic_calls_as_js_dict(ArrayList<CodeUnit> incoming_list, Program current_program)
     {
         String retval="{";

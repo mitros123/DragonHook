@@ -2,7 +2,6 @@ package dragonhook;
 
 import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.LinkedList;
 
 import dragonhook.util.AddressRangeMinMaxContainer;
 import dragonhook.util.ConsolePrinter;
@@ -11,7 +10,6 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.CodeUnit;
-import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.program.util.ProgramSelection;
@@ -31,7 +29,11 @@ public class DragonSelectionAddressRangeGathererTask extends Task {
     protected ProgramSelection incoming_program_selection;
     
     public DragonSelectionAddressRangeGathererTask(String title, Program incoming_program, PluginTool tool,ProgramSelection incoming_program_selection,ArrayList<CodeUnit> incoming_selection_to_exclude) {
-        super(title);
+        //Task(String title) means canCancel=false, so monitor.isCancelled() was permanently false
+        //and the cancel handling below could never trigger. No progress bar on purpose: progress is
+        //reported as counts inside monitor.setMessage().
+        //Arguments are (title, canCancel, hasProgress, isModal).
+        super(title, true, false, true);
         this.current_program=incoming_program;
         this.incoming_plugintool=tool;
         this.incoming_program_selection=incoming_program_selection;

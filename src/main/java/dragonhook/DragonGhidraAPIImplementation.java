@@ -1,9 +1,11 @@
 package dragonhook;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
-
-import com.sun.net.httpserver.HttpServer;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.regex.Pattern;
 
 import dragonhook.util.DOSLimitsTracker;
 import ghidra.framework.plugintool.Plugin;
@@ -12,6 +14,7 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.listing.CodeUnit;
+import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.Instruction;
@@ -26,8 +29,6 @@ import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.ReferenceManager;
 import ghidra.program.model.symbol.SourceType;
-import ghidra.program.util.ProgramSelection;
-//import ghidra.program.model.listing.CommentType;
 
 public class DragonGhidraAPIImplementation {
 
@@ -47,27 +48,37 @@ public class DragonGhidraAPIImplementation {
         this.max_displacement=2000000000;
     }
     
+    //String.replaceAll() compiles its pattern on every single call. These run once per function (and
+    //once per range, per comment, per instruction), so on a large program that was tens of thousands
+    //of Pattern compilations of a fairly long character class. Compile them once instead.
+    private static final Pattern pattern_for_variable_name=
+            Pattern.compile("[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_]");
+    private static final Pattern pattern_for_instruction_text=
+            Pattern.compile("[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_\\ \\,\\!\\+\\-\\#\\[\\]\\:\\.\\(\\)\\~\\$]");
+    private static final Pattern pattern_for_function_name=
+            Pattern.compile("[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_\\~\\:\\$]");
+
     public static String sanitize_str(String incoming_str)
     {
-        String characters_allowed_in_variable_name="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
-        return incoming_str.replaceAll("[^"+characters_allowed_in_variable_name+"]", "_");
+        if (incoming_str==null) { return ""; }
+        return pattern_for_variable_name.matcher(incoming_str).replaceAll("_");
     }
-    
+
     public static String sanitize_instruction_text(String incoming_str)
     {
-        String characters_allowed_in_variable_name="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_\\ \\,\\!\\+\\-\\#\\[\\]\\:\\.\\(\\)\\~\\$";
-        return incoming_str.replaceAll("[^"+characters_allowed_in_variable_name+"]", "_");
+        if (incoming_str==null) { return ""; }
+        return pattern_for_instruction_text.matcher(incoming_str).replaceAll("_");
     }
-    
+
     public static String sanitize_comment(String incoming_str)
     {
         return sanitize_instruction_text(incoming_str); //sanitize_instruction_text() is fine in this case
     }
-    
+
     public static String sanitize_fun_name(String incoming_str)
     {
-        String characters_allowed_in_variable_name="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_\\~\\:\\$";
-        return incoming_str.replaceAll("[^"+characters_allowed_in_variable_name+"]", "_");
+        if (incoming_str==null) { return ""; }
+        return pattern_for_function_name.matcher(incoming_str).replaceAll("_");
     }
     
     public static String return_offset_for_addr(Address in_addr, Program current_program) {
@@ -100,13 +111,26 @@ public class DragonGhidraAPIImplementation {
         Address image_base = this.current_program.getImageBase();
         Address max_addr=this.current_program.getMaxAddress();
         Address min_addr=this.current_program.getMinAddress();
-        Address target_addr=image_base.add(address_offset);
-        
+
+        //Address.add() throws AddressOutOfBoundsException when the sum leaves the address space.
+        //max_displacement allows offsets up to 2e9, so this is reachable on a program whose image
+        //base sits high in a 32 bit space. Uncaught it would kill the endpoint handler, and the
+        //http server closes the exchange without a reply, leaving the caller waiting.
+        Address target_addr;
+        try
+        {
+            target_addr=image_base.add(address_offset);
+        }
+        catch (Exception e)
+        {
+            return "Error, target address outside the range of valid addresses";
+        }
+
         if (target_addr.compareTo(min_addr)<0 || target_addr.compareTo(max_addr)>0)
         {
             return "Error, target address outside the range of valid addresses";
         }
-        
+
         return "ok";
     }
     
@@ -223,59 +247,90 @@ public class DragonGhidraAPIImplementation {
         return retval;
     }
     
-    //very computationally intensive. Can be optimized but it will be called at most once per agent execution.
+    //computationally intensive, but it will be called at most once per agent execution.
+    //
+    //The JS agent binary-searches the "ranges" array, so it MUST be globally sorted by range start.
+    //Iterating the functions by entry point does NOT give that ordering, because a function body can
+    //be non-contiguous: function A at 0x1000 may own a range at 0x5000 while function B starts at
+    //0x2000, so the naive emission order is 0x1000, 0x5000, 0x2000. Hence the explicit sort below.
+    //
+    //Only the two fields the agent actually consumes (fun_name / entrypoint_offset) are sent, and
+    //they are sent ONCE per function instead of once per range. Range bounds are plain numbers so
+    //that the agent does not have to parseInt() a hex string on every binary-search comparison.
+    //
     //returns an object of the form:
     /*
-        {"big_array_with_function_ranges":[
-        [...]
-        { "start": "0x50d8c0", "end": "0x50d8d2", "data": {"fun_name":"FUN_0060d8c0","entrypoint_offset":"0x50d8c0","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d8c0_void_","ranges":[["0x50d8c0","0x50d8d2"]]} },
-        { "start": "0x50d8e0", "end": "0x50d8f2", "data": {"fun_name":"FUN_0060d8e0","entrypoint_offset":"0x50d8e0","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d8e0_void_","ranges":[["0x50d8e0","0x50d8f2"]]} },
-        { "start": "0x50d900", "end": "0x50d912", "data": {"fun_name":"FUN_0060d900","entrypoint_offset":"0x50d900","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d900_void_","ranges":[["0x50d900","0x50d912"]]} },
-        { "start": "0x50d920", "end": "0x50d930", "data": {"fun_name":"FUN_0060d920","entrypoint_offset":"0x50d920","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d920_void_","ranges":[["0x50d920","0x50d930"],["0x50d938","0x50d946"]]} },
-        { "start": "0x50d938", "end": "0x50d946", "data": {"fun_name":"FUN_0060d920","entrypoint_offset":"0x50d920","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d920_void_","ranges":[["0x50d920","0x50d930"],["0x50d938","0x50d946"]]} },
-        { "start": "0x50d950", "end": "0x50d960", "data": {"fun_name":"FUN_0060d950","entrypoint_offset":"0x50d950","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d950_void_","ranges":[["0x50d950","0x50d960"],["0x50d968","0x50d976"]]} },
-        { "start": "0x50d968", "end": "0x50d976", "data": {"fun_name":"FUN_0060d950","entrypoint_offset":"0x50d950","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d950_void_","ranges":[["0x50d950","0x50d960"],["0x50d968","0x50d976"]]} },
-        { "start": "0x50d980", "end": "0x50d992", "data": {"fun_name":"FUN_0060d980","entrypoint_offset":"0x50d980","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d980_void_","ranges":[["0x50d980","0x50d992"]]} },
-        { "start": "0x50d9a0", "end": "0x50d9b2", "data": {"fun_name":"FUN_0060d9a0","entrypoint_offset":"0x50d9a0","num_of_params":0,"calling_convention":"unknown","fun_signature":"undefined_FUN_0060d9a0_void_","ranges":[["0x50d9a0","0x50d9b2"]]} },
-        [...]
-        ]}
+        {"function_ranges_compact":{
+            "functions":[ ["FUN_0060d8c0","0x50d8c0"], ["FUN_0060d920","0x50d920"], [...] ],
+            "ranges":[ [5298880,5298898,0], [5299000,5299016,1], [5299032,5299046,1], [...] ]
+        }}
+        each range is [start_offset, end_offset_inclusive, index_into_functions]
      */
-    
+
     public String ALL_FUN_DATA_SORTED_BY_RANGESTART()
     {
-        StringBuilder sb=new StringBuilder();
-        sb.append("{\"big_array_with_function_ranges\":[");
-        
-        Listing program_listing=this.current_program.getListing();
+        long time_at_start=System.nanoTime();
+        long image_base_offset=current_program.getImageBase().getOffset();
+        ArrayList<String> function_entries=new ArrayList<String>();   //index -> ["name","0xentrypoint"]
+        ArrayList<long[]> range_entries=new ArrayList<long[]>();      //{start, end, index into function_entries}
+
         FunctionIterator fun_iter = current_program.getFunctionManager().getFunctions(true);
         while (fun_iter!=null && fun_iter.hasNext())
         {
             Function current_function=fun_iter.next();
-            String name_of_fun=sanitize_str(current_function.getName(true));
-            Address start_of_fun=current_function.getEntryPoint();
-            long start_of_fun_as_long=current_function.getEntryPoint().getOffset() - current_program.getImageBase().getOffset();
-            String start_of_fun_offset=return_offset_for_addr(start_of_fun,current_program);
+            String name_of_fun=sanitize_fun_name(current_function.getName(true));
+            //inlined instead of return_offset_for_addr(), which re-reads the image base every call
+            String start_of_fun_offset="0x"+Long.toHexString(current_function.getEntryPoint().getOffset() - image_base_offset);
+            int index_of_this_function=function_entries.size();
+            function_entries.add("[\""+name_of_fun+"\",\""+start_of_fun_offset+"\"]");
+
             AddressRangeIterator current_function_ranges_iter= current_function.getBody().getAddressRanges(true);
-            String fundata=FUN_DATA_GIVEN_ADDR_OFFSET(start_of_fun_as_long,false); //we don't apply DOS limits here, there is a DOS limit for the ALL_FUN_DATA_SORTED_BY_RANGESTART()
-            int range_cnt=0;
             while (current_function_ranges_iter!=null && current_function_ranges_iter.hasNext())
             {
                 AddressRange current_function_range=current_function_ranges_iter.next();
-                String start_of_range_offset=return_offset_for_addr(current_function_range.getMinAddress(),current_program);
-                long start_of_range_offset_as_long=current_function_range.getMinAddress().getOffset() - current_program.getImageBase().getOffset();
-                String end_of_range_offset=return_offset_for_addr(current_function_range.getMaxAddress(),current_program);
-                range_cnt+=1;
-                String addcomma=",";
-                if (!fun_iter.hasNext() && !current_function_ranges_iter.hasNext())
-                {
-                    addcomma="";
-                }
-                sb.append("{ \"start\": \""+start_of_range_offset+"\", \"end\": \""+end_of_range_offset+"\", \"data\": "+fundata+" }"+addcomma+"");    
+                range_entries.add(new long[]{
+                        current_function_range.getMinAddress().getOffset() - image_base_offset,
+                        current_function_range.getMaxAddress().getOffset() - image_base_offset,
+                        index_of_this_function});
             }
         }
-        
-        sb.append("]}");
-        return sb.toString();
+
+        //required by the binary search on the agent side, see the comment above
+        Collections.sort(range_entries, new Comparator<long[]>() {
+            @Override
+            public int compare(long[] first_range, long[] second_range) {
+                return Long.compare(first_range[0], second_range[0]);
+            }
+        });
+
+        long time_after_gathering=System.nanoTime();
+
+        //preallocate, otherwise the builder doubles its backing array around twenty times and copies
+        //the whole multi megabyte string each time. ~48 bytes per function entry, ~28 per range.
+        StringBuilder sb=new StringBuilder(64 + function_entries.size()*48 + range_entries.size()*28);
+        sb.append("{\"function_ranges_compact\":{\"functions\":[");
+        for (int i=0;i<function_entries.size();i++)
+        {
+            if (i>0) { sb.append(","); }
+            sb.append(function_entries.get(i));
+        }
+        sb.append("],\"ranges\":[");
+        for (int i=0;i<range_entries.size();i++)
+        {
+            long[] current_range=range_entries.get(i);
+            if (i>0) { sb.append(","); }
+            sb.append('[').append(current_range[0]).append(',')
+              .append(current_range[1]).append(',').append(current_range[2]).append(']');
+        }
+        sb.append("]}}");
+        String retval=sb.toString();
+
+        long time_at_end=System.nanoTime();
+        System.out.println("ALL_FUN_DATA_SORTED_BY_RANGESTART: "+function_entries.size()+" functions, "
+                +range_entries.size()+" ranges, "+retval.length()+" chars. Gathering from ghidra took "
+                +((time_after_gathering-time_at_start)/1000000)+" ms, serialising took "
+                +((time_at_end-time_after_gathering)/1000000)+" ms.");
+        return retval;
     }
     
     
@@ -295,7 +350,7 @@ public class DragonGhidraAPIImplementation {
         Listing program_listing=this.current_program.getListing();
         Address image_base = this.current_program.getImageBase();
         Address target_addr=image_base.add(address_offset);
-        
+         
         
         CodeUnit target_codeunit= program_listing.getCodeUnitContaining(target_addr);
         
@@ -331,7 +386,7 @@ public class DragonGhidraAPIImplementation {
         
         //update the comment
         
-        String oldcomment=target_codeunit.getComment(CodeUnit.PRE_COMMENT); //use CommentType.PRE in later ghidra versions
+        String oldcomment=target_codeunit.getComment(CommentType.PRE); //use CodeUnit.PRE_COMMENT in previous ghidra versions
         String newcomment="";
         if (oldcomment==null)
         {
@@ -345,8 +400,17 @@ public class DragonGhidraAPIImplementation {
         try
         {
             int tx_id=current_program.startTransaction("Set comment");
-            target_codeunit.setComment(CodeUnit.PRE_COMMENT,newcomment);
-            current_program.endTransaction(tx_id, true);
+            boolean transaction_succeeded=false;
+            try
+            {
+                target_codeunit.setComment(CommentType.PRE,newcomment);
+                transaction_succeeded=true;
+            }
+            finally
+            {
+                //without this, an exception would leave the transaction open on the Program
+                current_program.endTransaction(tx_id, transaction_succeeded);
+            }
         }
         catch (Exception e)
         {
@@ -466,8 +530,17 @@ public class DragonGhidraAPIImplementation {
         {
             MemReferenceImpl this_ref= new MemReferenceImpl(target_codeunit_from.getMinAddress(), target_codeunit_to.getMinAddress(),reftype_of_xref,SourceType.USER_DEFINED,0,false);
             int tx_id=current_program.startTransaction("Set xref");
-            reference_manager.addReference(this_ref);
-            current_program.endTransaction(tx_id, true);
+            boolean transaction_succeeded=false;
+            try
+            {
+                reference_manager.addReference(this_ref);
+                transaction_succeeded=true;
+            }
+            finally
+            {
+                //without this, an exception would leave the transaction open on the Program
+                current_program.endTransaction(tx_id, transaction_succeeded);
+            }
         }
         catch (Exception e)
         {
@@ -571,7 +644,7 @@ public class DragonGhidraAPIImplementation {
             retval+="\"label\":\""+sanitize_str(target_codeunit.getLabel())+"\",";
         }
         
-        String PRE_comment=target_codeunit.getComment(CodeUnit.PRE_COMMENT); //use CommentType.PRE in later ghidra versions
+        String PRE_comment=target_codeunit.getComment(CommentType.PRE); //use CodeUnit.PRE_COMMENT in previous ghidra versions
         if (PRE_comment!=null)
         {
             retval+="\"pre_comment\":\""+sanitize_comment(PRE_comment)+"\","; 
@@ -719,11 +792,21 @@ public class DragonGhidraAPIImplementation {
         
         //write the memory
         try
-        { 
+        {
             int tx_id=this.current_program.startTransaction("Set mem");
-            program_listing.clearCodeUnits(target_addr, target_addr.add(length_of_array-1), false);
-            program_mem.setBytes(target_addr, decoded_bytes);
-            this.current_program.endTransaction(tx_id, true);
+            boolean transaction_succeeded=false;
+            try
+            {
+                program_listing.clearCodeUnits(target_addr, target_addr.add(length_of_array-1), false);
+                program_mem.setBytes(target_addr, decoded_bytes);
+                transaction_succeeded=true;
+            }
+            finally
+            {
+                //without this, an exception would leave the transaction open on the Program.
+                //Rolling back also undoes the clearCodeUnits() if setBytes() is the call that failed.
+                this.current_program.endTransaction(tx_id, transaction_succeeded);
+            }
         }
         catch (Exception e)
         {

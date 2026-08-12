@@ -5,7 +5,6 @@ import docking.action.DockingAction;
 import docking.action.MenuData;
 import dragonhook.util.ConsolePrinter;
 import dragonhook.util.CreatorOfNecessaryFiles;
-import dragonhook.util.FileAndDirOpener;
 import dragonhook.util.JSAgentPreparer;
 import ghidra.app.services.ProgramManager;
 import ghidra.framework.plugintool.Plugin;

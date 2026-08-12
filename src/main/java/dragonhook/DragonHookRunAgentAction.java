@@ -5,13 +5,11 @@ import docking.action.DockingAction;
 import docking.action.MenuData;
 import dragonhook.util.ConsolePrinter;
 import dragonhook.util.CreatorOfNecessaryFiles;
-import dragonhook.util.FileAndDirOpener;
 import dragonhook.util.JSAgentPreparer;
 import ghidra.app.services.ProgramManager;
 import ghidra.framework.plugintool.Plugin;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.program.model.listing.Program;
-import ghidra.program.util.ProgramSelection;
 
 public class DragonHookRunAgentAction extends DockingAction {
 
