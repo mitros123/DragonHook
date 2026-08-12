@@ -1,0 +1,241 @@
+name: Build & Release
+
+on:
+  # Manual run, optionally pinning a specific Ghidra version
+  workflow_dispatch:
+    inputs:
+      ghidra_version:
+        description: "Ghidra version to build against (blank = latest release)"
+        required: false
+        default: ""
+  # Tagging the repo cuts a DragonHook release
+  push:
+    tags:
+      - "v*"
+  # Weekly poll so a new Ghidra release automatically gets a build
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 1. Find the Ghidra release to build against
+      # ------------------------------------------------------------------
+      - name: Resolve Ghidra release
+        id: ghidra
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.ghidra_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${REQUESTED:-}" ]; then
+            JSON=$(gh api "repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_${REQUESTED}_build")
+          else
+            JSON=$(gh api repos/NationalSecurityAgency/ghidra/releases/latest)
+          fi
+
+          URL=$(jq -r '.assets[]
+                       | select(.name | test("^ghidra_.*_PUBLIC_[0-9]{8}\\.zip$"))
+                       | .browser_download_url' <<<"$JSON" | head -n1)
+          [ -n "$URL" ] || { echo "::error::No ghidra_*_PUBLIC_*.zip asset found"; exit 1; }
+
+          ASSET=$(basename "$URL")
+          VERSION=$(sed -E 's/^ghidra_([^_]+)_PUBLIC_.*/\1/' <<<"$ASSET")
+
+          echo "url=$URL"        >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET"    >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION">> "$GITHUB_OUTPUT"
+          echo "Building against Ghidra $VERSION ($ASSET)" >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 2. Download it (cached between runs, keyed on the asset name)
+      # ------------------------------------------------------------------
+      - name: Cache Ghidra install
+        id: ghidra-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ghidra
+          key: ghidra-${{ steps.ghidra.outputs.asset }}
+
+      - name: Download & extract Ghidra
+        if: steps.ghidra-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/ghidra
+          curl -fL --retry 3 --retry-delay 5 -o /tmp/ghidra.zip "${{ steps.ghidra.outputs.url }}"
+          unzip -q /tmp/ghidra.zip -d ~/ghidra
+          rm -f /tmp/ghidra.zip
+
+      # ------------------------------------------------------------------
+      # 3. Read the toolchain THIS Ghidra demands, instead of hardcoding it
+      #    Ghidra/application.properties declares:
+      #      application.gradle.min / application.gradle.max
+      #      application.java.min   / application.java.max
+      # ------------------------------------------------------------------
+      - name: Resolve required Gradle & JDK
+        id: toolchain
+        run: |
+          set -euo pipefail
+          INSTALL_DIR=$(echo "$HOME"/ghidra/ghidra_*_PUBLIC)
+          [ -d "$INSTALL_DIR" ] || { echo "::error::Ghidra install dir not found"; exit 1; }
+          echo "GHIDRA_INSTALL_DIR=$INSTALL_DIR" >> "$GITHUB_ENV"
+
+          PROPS="$INSTALL_DIR/Ghidra/application.properties"
+          echo "--- $PROPS ---"; cat "$PROPS"
+
+          prop() { grep -E "^$1=" "$PROPS" | head -n1 | cut -d= -f2- | tr -d '\r' | xargs; }
+
+          JAVA_MIN=$(prop application.java.min)
+          GRADLE_MIN=$(prop application.gradle.min)
+          GRADLE_MAX=$(prop application.gradle.max)
+          # Pre-11.x releases used a single application.gradle.version key
+          if [ -z "$GRADLE_MIN" ]; then GRADLE_MIN=$(prop application.gradle.version); fi
+          [ -n "$JAVA_MIN" ]   || { echo "::error::application.java.min missing";   exit 1; }
+          [ -n "$GRADLE_MIN" ] || { echo "::error::application.gradle.min missing"; exit 1; }
+
+          # Pick the lowest *published* Gradle >= min (and < max, if max is set).
+          # Lowest-supported is the version Ghidra is actually tested against;
+          # swap min() for max() below if you prefer to track the newest.
+          GRADLE=$(GRADLE_MIN="$GRADLE_MIN" GRADLE_MAX="$GRADLE_MAX" python3 - <<'PY'
+          import json, os, urllib.request
+
+          def key(v):
+              return tuple(int(p) for p in v.split("."))
+
+          lo = key(os.environ["GRADLE_MIN"])
+          hi = os.environ["GRADLE_MAX"].strip()
+          hi = key(hi) if hi else None
+
+          data = json.load(urllib.request.urlopen(
+              "https://services.gradle.org/versions/all", timeout=60))
+
+          ok = []
+          for r in data:
+              if r.get("snapshot") or r.get("nightly") or r.get("releaseNightly") \
+                 or r.get("broken") or r.get("rcFor"):
+                  continue
+              try:
+                  k = key(r["version"])
+              except ValueError:
+                  continue          # milestones, rc tags, etc.
+              if k >= lo and (hi is None or k < hi):
+                  ok.append((k, r["version"]))
+
+          print(min(ok)[1] if ok else os.environ["GRADLE_MIN"])
+          PY
+          )
+
+          echo "java=$JAVA_MIN"    >> "$GITHUB_OUTPUT"
+          echo "gradle=$GRADLE"    >> "$GITHUB_OUTPUT"
+          echo "Toolchain: JDK $JAVA_MIN, Gradle $GRADLE (min $GRADLE_MIN, max ${GRADLE_MAX:-none})" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.toolchain.outputs.java }}
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.toolchain.outputs.gradle }}
+
+      # ------------------------------------------------------------------
+      # 4. First-run initialization, headless (no X server on the runner)
+      # ------------------------------------------------------------------
+      - name: Initialize Ghidra
+        run: |
+          set -euo pipefail
+          chmod -R +x "$GHIDRA_INSTALL_DIR/support" "$GHIDRA_INSTALL_DIR/os" 2>/dev/null || true
+          mkdir -p /tmp/ghidra-init
+          "$GHIDRA_INSTALL_DIR/support/analyzeHeadless" \
+            /tmp/ghidra-init InitProject \
+            -import /bin/true \
+            -noanalysis \
+            -deleteProject
+
+      # ------------------------------------------------------------------
+      # 5. Build the extension
+      # ------------------------------------------------------------------
+      - name: Build extension
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir -p dist      # drop the committed zips so the glob is unambiguous
+          gradle buildExtension -PGHIDRA_INSTALL_DIR="$GHIDRA_INSTALL_DIR" --no-daemon --stacktrace
+          ls -lh dist
+
+      - name: Name the artifact
+        id: artifact
+        run: |
+          set -euo pipefail
+          BUILT=$(ls dist/*.zip | head -n1)
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            DH_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            DH_VERSION="$(git rev-parse --short HEAD)"
+          fi
+          BASE="${BUILT%.zip}"; BASE="${BASE%_DragonHook}"
+          FINAL="${BASE}_DragonHook_${DH_VERSION}.zip"
+          mv "$BUILT" "$FINAL"
+          echo "path=$FINAL"            >> "$GITHUB_OUTPUT"
+          echo "dh_version=$DH_VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dragonhook-ghidra-${{ steps.ghidra.outputs.version }}
+          path: ${{ steps.artifact.outputs.path }}
+
+      # ------------------------------------------------------------------
+      # 6. Publish to Releases
+      # ------------------------------------------------------------------
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ steps.artifact.outputs.path }}
+          GHIDRA_VERSION: ${{ steps.ghidra.outputs.version }}
+          GRADLE_VERSION: ${{ steps.toolchain.outputs.gradle }}
+          JAVA_VERSION: ${{ steps.toolchain.outputs.java }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+            TITLE="DragonHook $TAG (Ghidra $GHIDRA_VERSION)"
+          else
+            TAG="ghidra-$GHIDRA_VERSION"
+            TITLE="DragonHook for Ghidra $GHIDRA_VERSION"
+          fi
+
+          NOTES=$(cat <<EOF
+          Automated build of DragonHook against **Ghidra $GHIDRA_VERSION**.
+
+          - Ghidra: \`$GHIDRA_VERSION\`
+          - Gradle: \`$GRADLE_VERSION\`
+          - JDK: \`$JAVA_VERSION\`
+          - Commit: \`$GITHUB_SHA\`
+
+          Install via Ghidra → File → Install Extensions → **+** → select the zip, then restart.
+          EOF
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+              echo "Release $TAG already exists; nothing new to publish."
+              exit 0
+            fi
+            gh release upload "$TAG" "$ASSET" --clobber
+          else
+            gh release create "$TAG" "$ASSET" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "$NOTES"
+          fi
