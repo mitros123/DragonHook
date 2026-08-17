@@ -151,63 +151,183 @@ function find_strings_to_resolve_overlapping(offset_as_number,size_of_access)
 //---- how many bytes an instruction touches. On x86 capstone reports it on the memory operand, on
 //---- arm64 it has to be derived from the mnemonic and the width of the data register.
 
+//Strips x86 instruction prefixes (e.g. rep, repe, repz, repne, repnz, lock, bnd, notrack).
+//Capstone prepends prefixes directly into instruction.mnemonic (e.g. "rep movsb" or "lock cmpxchg"),
+//which prevents direct string/regex equality matches without prior normalization.
+function strip_x86_prefixes(mnemonic)
+{
+    return (""+mnemonic).toLowerCase().replace(/^(rep|repe|repz|repne|repnz|lock|bnd|notrack)\s+/, "");
+}
+
+//Strips ARM/Thumb 2-letter conditional execution suffixes (eq, ne, cs, cc, mi, pl, vs, vc, hi, ls, ge, lt, gt, le, al).
+//In ARM32, almost all instructions can be conditionally executed (e.g. "ldreq", "movweq", "addeq").
+//Stripping these condition codes normalizes the mnemonic for instruction table and opcode matching.
+function strip_arm_condition_codes(mnemonic)
+{
+    var m=(""+mnemonic).toLowerCase();
+    return m.replace(/(eq|ne|cs|cc|mi|pl|vs|vc|hi|ls|ge|lt|gt|le|al)$/, "");
+}
+
 //Width in bytes of one arm64 register, from its name.
 //Called from return_access_size_arm64().
 function return_register_width_arm64(name_of_register)
 {
     var name=(""+name_of_register).toLowerCase();
-    //these have to be tested BEFORE the first-letter switch, otherwise "sp" is read as an "s" (4 byte)
-    //register, which is the bug the same table has in other implementations
+    //Special 64-bit and 32-bit registers must be checked before the first-letter switch,
+    //otherwise "sp" would match 's' (single precision floating point = 4 bytes) instead of 8 bytes.
     if (name==="sp" || name==="fp" || name==="lr" || name==="xzr") { return 8; }
     if (name==="wsp" || name==="wzr") { return 4; }
     switch (name.charAt(0))
     {
-        case "q": return 16;
-        case "d": return 8;
-        case "s": return 4;
-        case "h": return 2;
-        case "b": return 1;
-        case "x": return 8;
-        case "w": return 4;
+        case "q": return 16; //128-bit quadword vector/FP
+        case "d": return 8;  //64-bit doubleword vector/FP
+        case "s": return 4;  //32-bit single precision vector/FP
+        case "h": return 2;  //16-bit half precision vector/FP
+        case "b": return 1;  //8-bit byte vector/FP
+        case "x": return 8;  //64-bit general purpose register
+        case "w": return 4;  //32-bit general purpose sub-register
+        case "z": return 16; //SVE scalable vector register (at least 128-bit)
+        case "v":            //NEON vector arrangements (e.g. v0.16b, v1.4s, etc.)
+            if (name.indexOf("16b")>=0 || name.indexOf("8h")>=0 || name.indexOf("4s")>=0 || name.indexOf("2d")>=0) { return 16; }
+            if (name.indexOf("8b")>=0 || name.indexOf("4h")>=0 || name.indexOf("2s")>=0 || name.indexOf("1d")>=0) { return 8; }
+            if (name.indexOf("4b")>=0 || name.indexOf("2h")>=0 || name.indexOf("1s")>=0) { return 4; }
+            return 16;
     }
     return 8;
 }
 
-//How many bytes an arm64 load or store touches, derived from the mnemonic and the data register.
+//How many bytes an arm64 load, store, atomic, or vector operation touches, derived from mnemonic and data registers.
 //Called from return_access_size_for_instruction().
 function return_access_size_arm64(instruction)
 {
     var mnemonic=(""+instruction.mnemonic).toLowerCase();
-    if (/^(ldrsb|ldarb|stlrb|ldxrb|stxrb|ldaxrb|stlxrb|ldrb|strb)/.test(mnemonic)) { return 1; }
-    if (/^(ldrsh|ldarh|stlrh|ldxrh|stxrh|ldaxrh|stlxrh|ldrh|strh)/.test(mnemonic)) { return 2; }
-    if (/^ldrsw/.test(mnemonic)) { return 4; }
-    if (/^(ld|st)[1-4]/.test(mnemonic)) { return 16; }   //vector table load/store
+    //1-byte atomics, sign/zero extending byte loads/stores
+    if (/^(ldrsb|ldursb|ldarb|stlrb|ldxrb|stxrb|ldaxrb|stlxrb|ldrb|strb|ldurb|sturb|swpb|casb|casab|caslb|casalb|ldaddb|ldclrb|ldeorb|ldsetb|ldsmaxb|ldsminb|ldumaxb|lduminb|staddb|stclrb|steorb|stsetb|stsmaxb|stsminb|stumaxb|stuminb|ldaprb)/.test(mnemonic)) { return 1; }
+    //2-byte halfword atomics, sign/zero extending halfword loads/stores
+    if (/^(ldrsh|ldursh|ldarh|stlrh|ldxrh|stxrh|ldaxrh|stlxrh|ldrh|strh|ldurh|sturh|swph|cash|casah|caslh|casalh|ldaddh|ldclrh|ldeorh|ldseth|ldsmaxh|ldsminh|ldumaxh|lduminh|staddh|stclrh|steorh|stseth|stsmaxh|stsminh|stumaxh|stuminh|ldaprh)/.test(mnemonic)) { return 2; }
+    //4-byte signed word loads
+    if (/^(ldrsw|ldursw)/.test(mnemonic)) { return 4; }
+    //Prefetch operations touch 1 byte cache lines
+    if (/^prfm/.test(mnemonic)) { return 1; }
+    //Vector single structure loads (ld1r, ld2, ld3, ld4)
+    if (/^ld1r/.test(mnemonic)) { return 16; }
+    if (/^(ld|st)2/.test(mnemonic)) { return 32; }
+    if (/^(ld|st)3/.test(mnemonic)) { return 48; }
+    if (/^(ld|st)4/.test(mnemonic)) { return 64; }
+    if (/^(ld|st)1/.test(mnemonic)) { return 16; }
+
+    //Derive standard load/store width from the first destination/source register operand
     var size_of_access=8;
     var operands=instruction.operands;
+    var reg_count=0;
     if (operands)
     {
         for (var i=0;i<operands.length;i++)
         {
             if (operands[i].type==="reg")
             {
-                size_of_access=return_register_width_arm64(operands[i].value);
-                break;
+                reg_count++;
+                if (reg_count===1)
+                {
+                    size_of_access=return_register_width_arm64(operands[i].value);
+                }
             }
         }
     }
-    if (/^(ld|st)n?p/.test(mnemonic)) { size_of_access*=2; }   //a pair touches two elements
+    //Load/store pair instructions (ldp/stp/ldnp/stnp/casp) access two consecutive registers (2x width)
+    if (/^(ld|st)n?p|casp/.test(mnemonic)) { size_of_access*=2; }
     return size_of_access;
+}
+
+//How many bytes an ARM32 / Thumb load or store touches.
+//Called from return_access_size_for_instruction().
+function return_access_size_arm32(instruction)
+{
+    var raw_mnemonic=(""+instruction.mnemonic).toLowerCase();
+    var mnemonic=strip_arm_condition_codes(raw_mnemonic);
+    if (/^(ldrb|ldrsb|strb|ldrexeb|strexb|tbb)/.test(mnemonic)) { return 1; }
+    if (/^(ldrh|ldrsh|strh|ldrexh|strexh|tbh)/.test(mnemonic)) { return 2; }
+    if (/^(ldrd|strd)/.test(mnemonic)) { return 8; }
+    //Block data transfer instructions (LDM, STM, PUSH, POP) touch 4 bytes per register transferred
+    if (/^(ldm|stm|push|pop|vldm|vstm)/.test(mnemonic))
+    {
+        var operands=instruction.operands;
+        var reg_operands=0;
+        if (operands)
+        {
+            for (var i=0;i<operands.length;i++)
+            {
+                if (operands[i].type==="reg") { reg_operands++; }
+            }
+        }
+        return Math.max(4, reg_operands * 4);
+    }
+    if (/^vld1/.test(mnemonic)) { return 16; }
+    if (/^vld2/.test(mnemonic)) { return 32; }
+    if (/^vld3/.test(mnemonic)) { return 48; }
+    if (/^vld4/.test(mnemonic)) { return 64; }
+    if (/^vldr|vstr/.test(mnemonic))
+    {
+        var ops=instruction.operands;
+        if (ops && ops.length>0 && ops[0].type==="reg")
+        {
+            var rname=(""+ops[0].value).toLowerCase();
+            if (rname.charAt(0)==="d") { return 8; }
+            if (rname.charAt(0)==="s") { return 4; }
+        }
+        return 4;
+    }
+    return 4;
+}
+
+//How many bytes an x86/x64 instruction touches, covering memory operands, string instructions, and vector moves.
+//Called from return_access_size_for_instruction().
+function return_access_size_x86(instruction)
+{
+    var raw_mnemonic=(""+instruction.mnemonic).toLowerCase();
+    var mnemonic=strip_x86_prefixes(raw_mnemonic);
+    //String & table instructions
+    if (/^(movsb|lodsb|stosb|cmpsb|scasb|insb|outsb|xlatb?)$/.test(mnemonic)) { return 1; }
+    if (/^(movsw|lodsw|stosw|cmpsw|scasw|insw|outsw)$/.test(mnemonic)) { return 2; }
+    if (/^(movsd|lodsd|stosd|cmpsd|scasd|insd|outsd)$/.test(mnemonic)) { return 4; }
+    if (/^(movsq|lodsq|stosq|cmpsq|scasq)$/.test(mnemonic)) { return 8; }
+    if (mnemonic==="maskmovq") { return 8; }
+    if (mnemonic==="maskmovdqu" || mnemonic==="vmaskmovdqu") { return 16; }
+
+    var operands=instruction.operands;
+    if (operands)
+    {
+        for (var i=0;i<operands.length;i++)
+        {
+            if (operands[i].type==="mem" && typeof operands[i].size==="number" && operands[i].size>0)
+            {
+                return operands[i].size;
+            }
+        }
+    }
+    if (/^vmov(dqu|dqa|ups|apd|ntdq|ntps|ntpd)512/.test(mnemonic)) { return 64; }
+    if (/^vmov(dqu|dqa|ups|apd|ntdq|ntps|ntpd)256/.test(mnemonic) || /^[vy]/.test(mnemonic)) { return 32; }
+    if (/^mov(dqu|dqa|ups|apd|ntdq|ntps|ntpd|aps)/.test(mnemonic) || /^[x]/.test(mnemonic)) { return 16; }
+    return 1;
 }
 
 //Bytes the instruction touches, per architecture. Called from the transform and from
 //collect_static_candidate_addresses(), so that the overlap test uses the real access span.
 function return_access_size_for_instruction(instruction)
 {
-    var operands=instruction.operands;
-    if (Process.arch==="arm64" || Process.arch==="arm")
+    if (Process.arch==="arm64")
     {
         return return_access_size_arm64(instruction);
     }
+    if (Process.arch==="arm")
+    {
+        return return_access_size_arm32(instruction);
+    }
+    if (Process.arch==="x64" || Process.arch==="ia32")
+    {
+        return return_access_size_x86(instruction);
+    }
+    var operands=instruction.operands;
     if (operands)
     {
         for (var i=0;i<operands.length;i++)
@@ -243,12 +363,20 @@ function return_offset_inside_our_module_or_null(in_addr)
     {
         return null;
     }
-    if (in_addr.compare(baseaddr_of_modulename_to_stalk)<0 ||
-        in_addr.compare(endaddr_of_modulename_to_stalk)>=0)
+    try
+    {
+        var ptr_addr = (typeof in_addr.compare === "function") ? in_addr : ptr(in_addr);
+        if (ptr_addr.compare(baseaddr_of_modulename_to_stalk)<0 ||
+            ptr_addr.compare(endaddr_of_modulename_to_stalk)>=0)
+        {
+            return null;
+        }
+        return ptr_addr.sub(baseaddr_of_modulename_to_stalk);
+    }
+    catch (err)
     {
         return null;
     }
-    return in_addr.sub(baseaddr_of_modulename_to_stalk);
 }
 
 
@@ -304,7 +432,7 @@ function update_ghidradb_with_comment_and_xref_for_string_reference(code_offset,
 
 
 //size_of_access is how many bytes the instruction touches from candidate_address onwards. Pass 1 for
-//an address that is merely FORMED (lea, adrp+add) rather than dereferenced.
+//an address that is merely FORMED (lea, adrp+add, movw+movt) rather than dereferenced.
 //Called for every candidate address, from both the compile time and the runtime path.
 function check_one_candidate_address_for_a_string(code_offset,candidate_address,size_of_access,how_it_was_found)
 {
@@ -327,22 +455,25 @@ function check_one_candidate_address_for_a_string(code_offset,candidate_address,
 }
 
 
-//Only these can plausibly carry an ADDRESS in an immediate operand. Treating every immediate as a
-//candidate meant that an ordinary constant, for instance the 0x404010 in "cmp dword [rbp-4],0x404010",
-//was checked against the string table, and in a non PIE module (where the runtime base equals the
-//ghidra image base) such a constant can land inside a selected string and produce an xref for a
-//reference the code never makes.
+//Mnemonics that can plausibly carry an ADDRESS in an immediate operand across architectures.
 var mnemonics_that_can_carry_an_address_immediate={
-    "mov":true,"movabs":true,"movl":true,"movq":true,"movz":true,"movk":true,
-    "push":true,"lea":true,"adr":true
+    //x86 / x64
+    "mov":true,"movabs":true,"movabsq":true,"movl":true,"movq":true,"movz":true,"movk":true,
+    "movzx":true,"movsx":true,"movsxd":true,
+    "push":true,"pushq":true,"pushl":true,
+    "lea":true,"leaq":true,"leal":true,
+    "cmp":true,"cmpq":true,"cmpl":true,"test":true,"testq":true,"testl":true,
+    //arm64
+    "adr":true,"adrp":true,"ldr":true,"ldrsw":true,"prfm":true,
+    //arm32
+    "movw":true,"movt":true
 };
 
 
-//An adrp result is only valid until something else writes that register. Without this, a stale entry
-//made every later "ldr x2,[x0,#imm]" compute an address from a page base that x0 no longer holds,
-//which is a pure false positive generator on arm64 where adrp registers are reused constantly.
+//An adrp or movw result is only valid until something else writes that register. Without this, a stale entry
+//made every later access compute an address from a page/halfword base that the register no longer holds.
 //Called at the end of collect_static_candidate_addresses() for each instruction.
-function forget_page_bases_clobbered_by(instruction,page_base_in_register,registers_we_just_set)
+function forget_page_bases_and_halfwords_clobbered_by(instruction,page_base_in_register,halfword_in_register,registers_we_just_set)
 {
     var registers_written=null;
     try { registers_written=instruction.regsWritten; } catch (err) { registers_written=null; }
@@ -354,6 +485,7 @@ function forget_page_bases_clobbered_by(instruction,page_base_in_register,regist
             var name_of_register=(""+registers_written[i]).toLowerCase();
             if (registers_we_just_set[name_of_register]) { continue; }
             if (name_of_register in page_base_in_register) { delete page_base_in_register[name_of_register]; }
+            if (name_of_register in halfword_in_register) { delete halfword_in_register[name_of_register]; }
         }
         return;
     }
@@ -363,20 +495,19 @@ function forget_page_bases_clobbered_by(instruction,page_base_in_register,regist
     if (operands && operands.length>0 && operands[0].type==="reg")
     {
         var name_of_destination=(""+operands[0].value).toLowerCase();
-        if (!registers_we_just_set[name_of_destination] && (name_of_destination in page_base_in_register))
+        if (!registers_we_just_set[name_of_destination])
         {
-            delete page_base_in_register[name_of_destination];
+            if (name_of_destination in page_base_in_register) { delete page_base_in_register[name_of_destination]; }
+            if (name_of_destination in halfword_in_register) { delete halfword_in_register[name_of_destination]; }
         }
     }
 }
 
 
 //Addresses an instruction forms that are already known while the block is being compiled: PC relative
-//memory operands, address bearing immediates, and the arm64 adrp/adr page computations.
-//page_base_in_register carries adrp results forward inside the block so that the following add/ldr
-//can be completed, and is pruned as soon as a register is clobbered.
+//memory operands (x64 rip, arm pc), address bearing immediates, arm64 adrp/adr computations, and arm32 movw/movt pairs.
 //Called from the transform, once per instruction while the block is being compiled.
-function collect_static_candidate_addresses(instruction,page_base_in_register)
+function collect_static_candidate_addresses(instruction,page_base_in_register,halfword_in_register)
 {
     var candidates=[];
     var operands=instruction.operands;
@@ -385,13 +516,12 @@ function collect_static_candidate_addresses(instruction,page_base_in_register)
         return candidates;
     }
     var address_after_instruction=instruction.address.add(instruction.size);
-    var mnemonic=(""+instruction.mnemonic).toLowerCase();
+    var raw_mnemonic=(""+instruction.mnemonic).toLowerCase();
+    var mnemonic=(Process.arch==="arm") ? strip_arm_condition_codes(raw_mnemonic) : strip_x86_prefixes(raw_mnemonic);
     var registers_we_just_set={};
-    //An address that is merely FORMED points AT the string, so only one byte need overlap. Using the
-    //operand width here instead would make "lea rax,[rip+x]" match a string starting up to 7 bytes
-    //after the formed address.
-    var the_instruction_only_forms_an_address=(mnemonic==="lea" || mnemonic==="adr"
-                                              || mnemonic==="adrp" || mnemonic==="add");
+    var the_instruction_only_forms_an_address=(mnemonic==="lea" || mnemonic==="leaq" || mnemonic==="leal"
+                                              || mnemonic==="adr" || mnemonic==="adrp"
+                                              || mnemonic==="add" || mnemonic==="movw" || mnemonic==="movt");
     var size_for_a_real_access=return_access_size_for_instruction(instruction);
 
     for (var i=0;i<operands.length;i++)
@@ -400,7 +530,7 @@ function collect_static_candidate_addresses(instruction,page_base_in_register)
 
         if (op.type==="imm")
         {
-            //arm64 adr/adrp: capstone hands us the already resolved absolute address or page base
+            //arm64 adrp: capstone hands us the already resolved absolute page base
             if (mnemonic==="adrp")
             {
                 if (operands.length>0 && operands[0].type==="reg")
@@ -409,12 +539,41 @@ function collect_static_candidate_addresses(instruction,page_base_in_register)
                     page_base_in_register[register_holding_the_page]=ptr(op.value);
                     registers_we_just_set[register_holding_the_page]=true;
                 }
-                continue;   //the page base on its own is not a string address
+                continue;
             }
-            //x86 "mov eax, 0x404000" / "push 0x404000" in non PIC code, and arm64 "adr"
+
+            //arm32 movw: sets low 16-bits
+            if (mnemonic==="movw" && operands.length>=2 && operands[0].type==="reg")
+            {
+                var movw_reg=(""+operands[0].value).toLowerCase();
+                var imm_val=typeof op.value==="number" ? op.value : parseInt(""+op.value, 16);
+                halfword_in_register[movw_reg]=imm_val & 0xffff;
+                registers_we_just_set[movw_reg]=true;
+                continue;
+            }
+
+            //arm32 movt: sets high 16-bits, completing full 32-bit address
+            if (mnemonic==="movt" && operands.length>=2 && operands[0].type==="reg")
+            {
+                var movt_reg=(""+operands[0].value).toLowerCase();
+                if (movt_reg in halfword_in_register)
+                {
+                    var high_val=typeof op.value==="number" ? op.value : parseInt(""+op.value, 16);
+                    var low_val=halfword_in_register[movt_reg];
+                    var full_32bit_addr=(((high_val & 0xffff) * 65536) + (low_val & 0xffff)) >>> 0;
+                    candidates.push({address:ptr(full_32bit_addr), size:1,
+                                     how_it_was_found:"arm32 movw+movt address pair"});
+                }
+                continue;
+            }
+
+            //immediate address operand across architectures
             if (mnemonic in mnemonics_that_can_carry_an_address_immediate)
             {
-                candidates.push({address:ptr(op.value), size:1});   //an immediate address is a pointer
+                var candidate_imm_val=ptr(op.value);
+                candidates.push({address:candidate_imm_val,
+                                 size:(the_instruction_only_forms_an_address ? 1 : size_for_a_real_access),
+                                 how_it_was_found:"immediate operand of "+mnemonic});
             }
             continue;
         }
@@ -423,27 +582,54 @@ function collect_static_candidate_addresses(instruction,page_base_in_register)
         {
             var m=op.value;
             var base_register=m.base ? (""+m.base).toLowerCase() : null;
-            if (base_register==="rip" || base_register==="eip" || base_register==="pc")
+            if (base_register==="rip" || base_register==="eip")
             {
                 candidates.push({address:address_after_instruction.add(m.disp || 0),
-                                 size:(the_instruction_only_forms_an_address ? 1 : size_for_a_real_access)});
+                                 size:(the_instruction_only_forms_an_address ? 1 : size_for_a_real_access),
+                                 how_it_was_found:"rip/eip-relative addressing"});
+            }
+            else if (base_register==="pc")
+            {
+                //arm32 / thumb pc-relative addressing
+                var pc_val;
+                if (Process.arch==="arm")
+                {
+                    var is_thumb=(instruction.size===2 || (instruction.address.toInt32() & 1) !== 0);
+                    pc_val=is_thumb ? ptr((instruction.address.toInt32() & ~3) + 4) : instruction.address.add(8);
+                }
+                else
+                {
+                    pc_val=instruction.address.add(instruction.size);
+                }
+                candidates.push({address:pc_val.add(m.disp || 0),
+                                 size:(the_instruction_only_forms_an_address ? 1 : size_for_a_real_access),
+                                 how_it_was_found:"pc-relative memory operand"});
+            }
+            else if (base_register===null && typeof m.disp==="number" && m.disp!==0)
+            {
+                //literal load with offset relative to PC (ARM64 ldr literal)
+                candidates.push({address:instruction.address.add(m.disp),
+                                 size:(the_instruction_only_forms_an_address ? 1 : size_for_a_real_access),
+                                 how_it_was_found:"pc-relative literal operand"});
             }
             else if (base_register!==null && (base_register in page_base_in_register))
             {
-                //arm64 "adrp x0,#page" followed by "ldr x1,[x0,#lo12]"
+                //arm64 "adrp x0,#page" followed by "ldr/str/ldur/stur/ldp/stp"
                 candidates.push({address:page_base_in_register[base_register].add(m.disp || 0),
-                                 size:(the_instruction_only_forms_an_address ? 1 : size_for_a_real_access)});
+                                 size:(the_instruction_only_forms_an_address ? 1 : size_for_a_real_access),
+                                 how_it_was_found:"arm64 adrp page + memory displacement"});
             }
         }
     }
 
-    //arm64 "adrp x0,#page" followed by "add x0,x0,#lo12", which is the usual way to form a string address
-    if (mnemonic==="add" && operands.length===3 &&
+    //arm64 "adrp x0,#page" followed by "add x0,x0,#lo12"
+    if ((mnemonic==="add" || mnemonic==="adds") && operands.length===3 &&
         operands[1].type==="reg" && operands[2].type==="imm" &&
         ((""+operands[1].value).toLowerCase() in page_base_in_register))
     {
         var completed_address=page_base_in_register[(""+operands[1].value).toLowerCase()].add(operands[2].value);
-        candidates.push({address:completed_address, size:1});   //adrp+add forms the address
+        candidates.push({address:completed_address, size:1,
+                         how_it_was_found:"arm64 adrp+add address composition"});
         if (operands[0].type==="reg")
         {
             var name_of_destination=(""+operands[0].value).toLowerCase();
@@ -452,15 +638,15 @@ function collect_static_candidate_addresses(instruction,page_base_in_register)
         }
     }
 
-    forget_page_bases_clobbered_by(instruction,page_base_in_register,registers_we_just_set);
+    forget_page_bases_and_halfwords_clobbered_by(instruction,page_base_in_register,halfword_in_register,registers_we_just_set);
     return candidates;
 }
 
 
-//arm64 sign/zero extends the index register before scaling it: "ldr x0,[x1,w2,uxtw #2]" uses only
-//the low 32 bits of x2. Applying just the shift to the full 64 bit view computes a wrong address
-//whenever the upper half is non zero.
-//Called from apply_arm64_extend_to_index() for the sxt* forms.
+//Sign-extends an N-bit value in a NativePointer across the full pointer width (32-bit or 64-bit).
+//ARM64 sign-extends index registers before scaling: for example, "ldr x0, [x1, w2, sxtw #2]"
+//interprets the 32-bit value in w2 as signed. If bit 31 is set, it must be sign-extended to 64-bits
+//so that adding it to base x1 subtracts the appropriate offset rather than adding 0x00000000FFFFFFFF.
 function sign_extend_pointer(value_as_pointer,number_of_bits)
 {
     var mask=ptr(1).shl(number_of_bits).sub(1);
@@ -468,116 +654,282 @@ function sign_extend_pointer(value_as_pointer,number_of_bits)
     var sign_bit=ptr(1).shl(number_of_bits-1);
     if (!masked_value.and(sign_bit).isNull())
     {
+        //Subtracting 2^N propagates sign bits through the entire 64-bit pointer
         return masked_value.sub(ptr(1).shl(number_of_bits));
     }
     return masked_value;
 }
 
-//Applies an arm64 uxt*/sxt* extend to an index register value before it is scaled.
-//Called from inside the runtime resolver closure, on the stalked thread.
-function apply_arm64_extend_to_index(value_as_pointer,name_of_extend)
+//Applies index extensions (uxt*/sxt*) and shifts (lsl, lsr, asr, ror) across ARM32 and ARM64.
+//Called from inside the runtime resolver closure on the stalked thread.
+function apply_index_transform(value_as_pointer,name_of_extend,name_of_shift,shift_val)
 {
-    switch (name_of_extend)
+    var p=value_as_pointer;
+    //1. Apply zero or sign extension across sub-word index registers
+    if (name_of_extend)
     {
-        case "uxtb": return value_as_pointer.and(ptr(0xff));
-        case "uxth": return value_as_pointer.and(ptr(0xffff));
-        case "uxtw": return value_as_pointer.and(ptr("0xffffffff"));
-        case "sxtb": return sign_extend_pointer(value_as_pointer,8);
-        case "sxth": return sign_extend_pointer(value_as_pointer,16);
-        case "sxtw": return sign_extend_pointer(value_as_pointer,32);
-        default:     return value_as_pointer;   //uxtx / sxtx / none
+        switch (name_of_extend)
+        {
+            case "uxtb": p=p.and(ptr(0xff)); break;          //Unsigned extend byte (low 8 bits)
+            case "uxth": p=p.and(ptr(0xffff)); break;        //Unsigned extend halfword (low 16 bits)
+            case "uxtw": p=p.and(ptr("0xffffffff")); break;  //Unsigned extend word (low 32 bits)
+            case "sxtb": p=sign_extend_pointer(p,8); break;  //Signed extend byte (sign bit 7)
+            case "sxth": p=sign_extend_pointer(p,16); break; //Signed extend halfword (sign bit 15)
+            case "sxtw": p=sign_extend_pointer(p,32); break; //Signed extend word (sign bit 31)
+        }
     }
+    //2. Apply directional shift or rotation
+    if (shift_val && shift_val>0)
+    {
+        var stype=name_of_shift ? name_of_shift.toLowerCase() : "lsl";
+        if (stype.indexOf("lsr")>=0)
+        {
+            //Logical Shift Right: fills vacated high bits with zeros
+            p=p.shr(shift_val);
+        }
+        else if (stype.indexOf("asr")>=0)
+        {
+            //Arithmetic Shift Right: must preserve the sign bit.
+            //Note: Frida's NativePointer class does NOT implement .sar().
+            //We emulate ASR by:
+            //  a) Testing if the highest bit ((Process.pointerSize * 8) - 1) is 1.
+            //  b) Performing a logical shift right (.shr).
+            //  c) If negative, synthesizing a high-bit mask ((1 << shift_val) - 1) << (total_bits - shift_val)
+            //     and bitwise-ORing it into the result.
+            var is_negative = !p.and(ptr(1).shl((Process.pointerSize * 8) - 1)).isNull();
+            p = p.shr(shift_val);
+            if (is_negative)
+            {
+                var mask = ptr(1).shl(shift_val).sub(1).shl((Process.pointerSize * 8) - shift_val);
+                p = p.or(mask);
+            }
+        }
+        else if (stype.indexOf("ror")>=0)
+        {
+            //Rotate Right: bits shifted off the right wrap around to the high bits
+            var bits=Process.pointerSize * 8;
+            var s=shift_val % bits;
+            p=p.shr(s).or(p.shl(bits - s));
+        }
+        else
+        {
+            //Logical Shift Left (default for lsl and unscaled index multipliers)
+            p=p.shl(shift_val);
+        }
+    }
+    return p;
 }
 
 
-//Returns a closure that computes the effective address of the instruction's memory operand from a
-//live CpuContext, or null when there is no register based memory operand to resolve.
+//Returns a closure that computes the effective address(es) of the instruction's memory access(es) from a
+//live CpuContext, covering explicit memory operands, multiple memory operands, and implicit string/table instructions.
+//Returns null when there is no register based memory access to resolve.
 //Called from the transform. The closure it returns is what the callout runs on every execution.
 function build_runtime_memory_address_resolver(instruction)
 {
     var operands=instruction.operands;
-    if (!operands)
+    var raw_mnemonic=(""+instruction.mnemonic).toLowerCase();
+    var mnemonic=(Process.arch==="arm") ? strip_arm_condition_codes(raw_mnemonic) : strip_x86_prefixes(raw_mnemonic);
+    var mem_resolvers=[];
+
+    //--- 1. EXPLICIT MEMORY OPERANDS:
+    //Iterates over all operands parsed by Capstone. Instructions can have 1 or more memory operands
+    //(e.g., AVX gather instructions or ARM64 ldp/stp with pre/post-indexed addressing).
+    if (operands)
+    {
+        for (var i=0;i<operands.length;i++)
+        {
+            var op=operands[i];
+            if (op.type!=="mem")
+            {
+                continue;
+            }
+            var m=op.value;
+            //x86 Segment Overrides:
+            //Ignore Thread-Local Storage (TLS) and stack protector canaries on fs: (x86_64) or gs: (ia32).
+            //Standard segments (ds, cs, ss, es) are normal flat data references.
+            var name_of_segment=m.segment ? (""+m.segment).toLowerCase() : null;
+            if (name_of_segment!==null && name_of_segment!=="ds" && name_of_segment!=="cs"
+                && name_of_segment!=="ss" && name_of_segment!=="es")
+            {
+                continue;
+            }
+            var base_register=m.base || null;
+            var index_register=m.index || null;
+            if (base_register===null && index_register===null)
+            {
+                continue;
+            }
+            //RIP/EIP/PC-relative addresses are already extracted at compile time (free)
+            if (base_register==="rip" || base_register==="eip" || base_register==="pc")
+            {
+                continue;
+            }
+
+            let base_reg=base_register;
+            let index_reg=index_register;
+            let displacement=m.disp || 0;
+            let op_size=typeof op.size==="number" && op.size>0 ? op.size : return_access_size_for_instruction(instruction);
+
+            //Extract scale multiplier / shift
+            var shift_val_for_index=scale_to_shift_for_string_refs[m.scale || 1];
+            if (shift_val_for_index===undefined) { shift_val_for_index=0; }
+            var name_of_shift_for_index="lsl";
+            var name_of_extend_for_index=op.ext ? (""+op.ext).toLowerCase() : null;
+
+            //ARM64 explicit shift descriptors on the index operand
+            if (op.shift && typeof op.shift.value==="number")
+            {
+                var type_of_shift=(""+op.shift.type).toLowerCase();
+                name_of_shift_for_index=type_of_shift;
+                shift_val_for_index=op.shift.value;
+            }
+            //ARM64 w-register indices default to uxtw (zero-extended 32-bit to 64-bit)
+            if (name_of_extend_for_index===null && index_reg!==null
+                && (""+index_reg).toLowerCase().charAt(0)==="w")
+            {
+                name_of_extend_for_index="uxtw";
+            }
+
+            let captured_shift_val=shift_val_for_index;
+            let captured_shift_type=name_of_shift_for_index;
+            let captured_extend=name_of_extend_for_index;
+
+            //Push resolver closure evaluating this explicit memory operand against a CpuContext
+            mem_resolvers.push(function (context) {
+                var effective_address;
+                if (base_reg!==null)
+                {
+                    var value_of_base=return_register_value_from_context(context,base_reg);
+                    if (value_of_base===undefined) { return null; }
+                    effective_address=ptr(value_of_base);
+                }
+                else
+                {
+                    effective_address=ptr(0);
+                }
+                if (index_reg!==null)
+                {
+                    var value_of_index=return_register_value_from_context(context,index_reg);
+                    if (value_of_index===undefined) { return null; }
+                    var index_transformed=apply_index_transform(ptr(value_of_index),captured_extend,captured_shift_type,captured_shift_val);
+                    effective_address=effective_address.add(index_transformed);
+                }
+                return {
+                    address: effective_address.add(displacement),
+                    size: op_size,
+                    how_it_was_found: "memory operand ["+(base_reg||"")+(index_reg?("+"+index_reg):"")+"]"
+                };
+            });
+        }
+    }
+
+    //--- 2. IMPLICIT MEMORY OPERANDS (x86/x64 String & Table Instructions, ARM32 Multiple Load/Stores)
+    if (Process.arch==="x64" || Process.arch==="ia32")
+    {
+        //x86 String Instructions (Source: RSI / ESI):
+        //movs (move string), lods (load string), cmps (compare string), outs (output to port)
+        if (/^(movs|lods|cmps|outs)/.test(mnemonic))
+        {
+            let str_size=1;
+            if (/^(movsb|lodsb|cmpsb|outsb)$/.test(mnemonic)) { str_size=1; }
+            else if (/^(movsw|lodsw|cmpsw|outsw)$/.test(mnemonic)) { str_size=2; }
+            else if (/^(movsd|lodsd|cmpsd|outsd)$/.test(mnemonic)) { str_size=4; }
+            else if (/^(movsq|lodsq|cmpsq|outsq)$/.test(mnemonic)) { str_size=8; }
+
+            mem_resolvers.push(function (context) {
+                var val_rsi=return_register_value_from_context(context, Process.arch==="x64" ? "rsi" : "esi");
+                if (val_rsi===undefined) { return null; }
+                return { address: ptr(val_rsi), size: str_size, how_it_was_found: "implicit string source ("+mnemonic+")" };
+            });
+        }
+
+        //x86 String Instructions (Destination: RDI / EDI):
+        //movs (move string), stos (store string), cmps (compare string), scas (scan string), ins (input from port)
+        if (/^(movs|stos|cmps|scas|ins)/.test(mnemonic))
+        {
+            let str_size=1;
+            if (/^(movsb|stosb|cmpsb|scasb|insb)$/.test(mnemonic)) { str_size=1; }
+            else if (/^(movsw|stosw|cmpsw|scasw|insw)$/.test(mnemonic)) { str_size=2; }
+            else if (/^(movsd|stosd|cmpsd|scasd|insd)$/.test(mnemonic)) { str_size=4; }
+            else if (/^(movsq|stosq|cmpsq|scasq)$/.test(mnemonic)) { str_size=8; }
+
+            mem_resolvers.push(function (context) {
+                var val_rdi=return_register_value_from_context(context, Process.arch==="x64" ? "rdi" : "edi");
+                if (val_rdi===undefined) { return null; }
+                return { address: ptr(val_rdi), size: str_size, how_it_was_found: "implicit string target ("+mnemonic+")" };
+            });
+        }
+
+        //x86 XLAT / XLATB (Table Lookup):
+        //Loads a byte into AL from the translation table at address [RBX/EBX + AL].
+        if (mnemonic==="xlat" || mnemonic==="xlatb")
+        {
+            mem_resolvers.push(function (context) {
+                var val_rbx=return_register_value_from_context(context, Process.arch==="x64" ? "rbx" : "ebx");
+                var val_al=return_register_value_from_context(context, "al");
+                if (val_rbx===undefined || val_al===undefined) { return null; }
+                return { address: ptr(val_rbx).add(ptr(val_al)), size: 1, how_it_was_found: "table lookup ("+mnemonic+")" };
+            });
+        }
+
+        //x86 MASKMOVQ / MASKMOVDQU (Conditional Byte Write):
+        //Implicitly writes vector bytes into memory starting at address [RDI / EDI].
+        if (mnemonic==="maskmovq" || mnemonic==="maskmovdqu" || mnemonic==="vmaskmovdqu")
+        {
+            let mask_size=(mnemonic==="maskmovq") ? 8 : 16;
+            mem_resolvers.push(function (context) {
+                var val_rdi=return_register_value_from_context(context, Process.arch==="x64" ? "rdi" : "edi");
+                if (val_rdi===undefined) { return null; }
+                return { address: ptr(val_rdi), size: mask_size, how_it_was_found: "masked vector write ("+mnemonic+")" };
+            });
+        }
+    }
+
+    //ARM32 LDM / STM / PUSH / POP multiple load/store instructions:
+    //Transfers a list of registers to/from memory addressed by a base register or SP.
+    if (Process.arch==="arm" && /^(ldm|stm|push|pop)/.test(mnemonic))
+    {
+        if (mnemonic==="push" || mnemonic==="pop")
+        {
+            let total_bytes=Math.max(1, operands ? operands.length : 1) * 4;
+            mem_resolvers.push(function (context) {
+                var val_sp=return_register_value_from_context(context, "sp");
+                if (val_sp===undefined) { return null; }
+                return { address: ptr(val_sp), size: total_bytes, how_it_was_found: "stack operation ("+mnemonic+")" };
+            });
+        }
+        else if (operands && operands.length>0 && operands[0].type==="reg")
+        {
+            let base_rname=(""+operands[0].value).toLowerCase();
+            let num_regs=Math.max(1, operands.length - 1);
+            let total_bytes=num_regs * 4;
+            mem_resolvers.push(function (context) {
+                var val_base=return_register_value_from_context(context, base_rname);
+                if (val_base===undefined) { return null; }
+                return { address: ptr(val_base), size: total_bytes, how_it_was_found: "multiple load/store ("+mnemonic+")" };
+            });
+        }
+    }
+
+    if (mem_resolvers.length===0)
     {
         return null;
     }
-    for (var i=0;i<operands.length;i++)
-    {
-        var op=operands[i];
-        if (op.type!=="mem")
-        {
-            continue;
-        }
-        var m=op.value;
-        //x86 segment relative accesses (fs:/gs:, so TLS and the stack cookie). The segment base is
-        //not recoverable from the CpuContext, so computing base+disp and ignoring it would yield an
-        //address in the wrong space entirely, which is a false positive waiting to happen.
-        var name_of_segment=m.segment ? (""+m.segment).toLowerCase() : null;
-        if (name_of_segment!==null && name_of_segment!=="ds" && name_of_segment!=="cs"
-            && name_of_segment!=="ss" && name_of_segment!=="es")
-        {
-            continue;
-        }
-        var base_register=m.base || null;
-        var index_register=m.index || null;
-        if (base_register===null && index_register===null)
-        {
-            continue;
-        }
-        if (base_register==="rip" || base_register==="eip" || base_register==="pc")
-        {
-            continue;   //already handled statically
-        }
-        var displacement=m.disp || 0;
-        //x86 expresses index scaling as a scale factor on the memory operand, arm64 as a shift on the
-        //operand itself ("ldr x0,[x1,x2,lsl #3]"). Reading only m.scale computed x1+x2 instead of
-        //x1+(x2<<3) on arm64, which is simply the wrong address.
-        var shift_for_index=scale_to_shift_for_string_refs[m.scale || 1];
-        if (shift_for_index===undefined) { shift_for_index=0; }
-        var name_of_extend_for_index=op.ext ? (""+op.ext).toLowerCase() : null;
-        if (op.shift && typeof op.shift.value==="number")
-        {
-            var type_of_shift=(""+op.shift.type).toLowerCase();
-            if (type_of_shift.indexOf("lsl")>=0)
-            {
-                shift_for_index=op.shift.value;
-            }
-            else if (name_of_extend_for_index===null)
-            {
-                //on some frida versions the extend arrives as the shift type rather than in op.ext
-                name_of_extend_for_index=type_of_shift;
-                shift_for_index=op.shift.value;
-            }
-        }
-        //a "w" index with no explicit extend is still only 32 bits wide
-        if (name_of_extend_for_index===null && index_register!==null
-            && (""+index_register).toLowerCase().charAt(0)==="w")
-        {
-            name_of_extend_for_index="uxtw";
-        }
 
-        return function (context) {
-            var effective_address;
-            if (base_register!==null)
+    //Return composite dispatcher returning all resolved memory items
+    return function (context) {
+        var results=[];
+        for (var idx=0;idx<mem_resolvers.length;idx++)
+        {
+            var res=mem_resolvers[idx](context);
+            if (res!==null && res.address!==null && res.address!==undefined)
             {
-                var value_of_base=return_register_value_from_context(context,base_register);
-                if (value_of_base===undefined) { return null; }
-                effective_address=ptr(value_of_base);
+                results.push(res);
             }
-            else
-            {
-                effective_address=ptr(0);
-            }
-            if (index_register!==null)
-            {
-                var value_of_index=return_register_value_from_context(context,index_register);
-                if (value_of_index===undefined) { return null; }
-                var index_after_extend=apply_arm64_extend_to_index(ptr(value_of_index),name_of_extend_for_index);
-                effective_address=effective_address.add(index_after_extend.shl(shift_for_index));
-            }
-            return effective_address.add(displacement);
-        };
-    }
-    return null;
+        }
+        return results;
+    };
 }
 
 
@@ -648,8 +1000,32 @@ function arm_the_timer_for_dropping_register_based_instrumentation()
 }
 
 
+//Safely invalidates a Stalker translated basic block containing inst_address.
+//Why this is needed:
+//Frida's Stalker JIT-compiles basic blocks into a private execution cache. When a callout is emitted
+//via iterator.putCallout(), that callout runs every time the instruction executes.
+//Once a given instruction's string reference has been resolved max_times_to_log_each_string_reference times,
+//we invalidate the block so Frida recompiles it WITHOUT the callout, completely eliminating runtime overhead.
+//Different Frida API versions support either Stalker.invalidate(thread_id, address) or Stalker.invalidate(address).
+function safe_stalker_invalidate(thread_id, inst_address)
+{
+    try
+    {
+        Stalker.invalidate(thread_id, inst_address);
+    }
+    catch (e1)
+    {
+        try
+        {
+            Stalker.invalidate(inst_address);
+        }
+        catch (e2) {}
+    }
+}
+
+
 //Follows one thread and examines every instruction in our module for string references, resolving
-//what it can at compile time and emitting a callout only for register based addresses.
+//what it can at compile time and emitting a callout for register based addresses and implicit memory operations.
 //Called from startStalker() when string reference resolution is the selected feature.
 function stalker_follow_and_resolve_string_references(threadId)
 {
@@ -657,6 +1033,7 @@ function stalker_follow_and_resolve_string_references(threadId)
         transform: function (iterator) {
             var instruction;
             var page_base_in_register={};   //arm64 adrp state, valid only inside this block
+            var halfword_in_register={};    //arm32 movw state, valid only inside this block
             while ((instruction = iterator.next()) !== null)
             {
                 if (strings_to_resolve_are_loaded && modulename_to_stalk_has_been_loaded &&
@@ -673,61 +1050,53 @@ function stalker_follow_and_resolve_string_references(threadId)
 
                     if (!have_we_logged_enough_string_references_for(code_offset_as_str))
                     {
-                        //"lea" (and arm64 adr/adrp/add) only FORM an address, so a single byte has to
-                        //overlap the string. Everything else really touches size_of_access bytes.
-                        let mnemonic_of_instruction=(""+instruction.mnemonic).toLowerCase();
-                        let size_of_access=1;
-                        try
-                        {
-                            size_of_access=(mnemonic_of_instruction==="lea") ? 1
-                                : return_access_size_for_instruction(instruction);
-                        }
-                        catch (err) { size_of_access=1; }
-
                         //compile time resolution, free at runtime
                         try
                         {
-                            //"var" is fine for these two: they are consumed here and now, during the
-                            //compile, and no callout closes over them
-                            var static_candidates=collect_static_candidate_addresses(instruction,page_base_in_register);
+                            var static_candidates=collect_static_candidate_addresses(instruction,page_base_in_register,halfword_in_register);
                             for (var ind_cand=0;ind_cand<static_candidates.length;ind_cand++)
                             {
                                 check_one_candidate_address_for_a_string(code_offset,
                                     static_candidates[ind_cand].address,
                                     static_candidates[ind_cand].size,
-                                    "static analysis of the instruction");
+                                    static_candidates[ind_cand].how_it_was_found || "static analysis of the instruction");
                             }
                         }
                         catch (err) { /* an operand shape we do not understand, keep going */ }
 
-                        //runtime resolution, only for addresses that are built from registers
+                        //runtime resolution, for addresses that are built from registers or implicit instructions
                         if (also_instrument_register_based_memory_accesses)
                         {
-                            let resolve_memory_address=null;   //let: the callout below closes over it
-                            try { resolve_memory_address=build_runtime_memory_address_resolver(instruction); }
-                            catch (err) { resolve_memory_address=null; }
+                            let resolve_memory_addresses=null;
+                            try { resolve_memory_addresses=build_runtime_memory_address_resolver(instruction); }
+                            catch (err) { resolve_memory_addresses=null; }
 
-                            if (resolve_memory_address!==null)
+                            if (resolve_memory_addresses!==null)
                             {
-                                //let: captured by the callout, so it must be one binding per instruction
                                 let instruction_address=instruction.address;
                                 iterator.putCallout(function (context) {
                                     if (have_we_logged_enough_string_references_for(code_offset_as_str))
                                     {
-                                        Stalker.invalidate(instruction_address);   //stop paying for it
+                                        safe_stalker_invalidate(threadId, instruction_address);
                                         return;
                                     }
-                                    //declared inside the callout, so every execution gets its own
-                                    var candidate_address=null;
-                                    try { candidate_address=resolve_memory_address(context); }
+                                    var candidate_list=null;
+                                    try { candidate_list=resolve_memory_addresses(context); }
                                     catch (err) { return; }
-                                    if (candidate_address===null) { return; }
-                                    if (check_one_candidate_address_for_a_string(code_offset,candidate_address,
-                                            size_of_access,"a memory access observed at runtime"))
+                                    if (!candidate_list || candidate_list.length===0) { return; }
+
+                                    for (var ind_mem=0;ind_mem<candidate_list.length;ind_mem++)
                                     {
-                                        if (have_we_logged_enough_string_references_for(code_offset_as_str))
+                                        var cand_item=candidate_list[ind_mem];
+                                        if (!cand_item || !cand_item.address) { continue; }
+                                        if (check_one_candidate_address_for_a_string(code_offset,cand_item.address,
+                                                cand_item.size,cand_item.how_it_was_found || "a memory access observed at runtime"))
                                         {
-                                            Stalker.invalidate(instruction_address);
+                                            if (have_we_logged_enough_string_references_for(code_offset_as_str))
+                                            {
+                                                safe_stalker_invalidate(threadId, instruction_address);
+                                                break;
+                                            }
                                         }
                                     }
                                 });

@@ -29,35 +29,179 @@ function binarySearchFunRange(offset_as_number) {
     return null;
 }
 
-//Capstone and frida do not agree on every register name. Capstone reports the arm64 frame pointer
-//and link register as x29 and x30, while frida's Arm64CpuContext exposes them as fp and lr, and a
-//32 bit view such as w2 has no entry at all. Reading context[name] directly therefore returned
-//undefined for the frame pointer, which is one of the most common bases for a memory access.
-var register_name_aliases_for_cpu_context={"x29":"fp","x30":"lr","w29":"fp","w30":"lr"};
+//Capstone and frida do not agree on every register name, and sub-registers (e.g. 32-bit views
+//in 64-bit mode, 16-bit or 8-bit views, and zero registers) are not directly exposed on CpuContext.
+//This mapping and resolver ensures all register views across x86, x64, arm, and arm64 resolve properly.
+var register_name_aliases_for_cpu_context={
+    //arm64
+    "x29":"fp","x30":"lr","w29":"fp","w30":"lr",
+    //arm32
+    "ip":"r12","sb":"r9","sl":"r10",
+    "r13":"sp","r14":"lr","r15":"pc"
+};
 
 //Reads a register out of a live CpuContext by capstone's name for it, coping with the naming
-//mismatches. Called from the runtime address resolver in module 06, inside a Stalker callout.
+//mismatches, zero registers, sub-register masks (32-bit/16-bit/8-bit on x64/x86/arm64), and architecture aliases.
+//Called from the runtime address resolver in module 06, inside a Stalker callout.
 function return_register_value_from_context(context,register_name)
 {
     if (!context || !register_name)
     {
         return undefined;
     }
-    var value_of_register=context[register_name];
-    if (value_of_register!==undefined)
+    //Direct match on context (fast path)
+    var raw_val=context[register_name];
+    if (raw_val!==undefined)
     {
-        return value_of_register;
+        return raw_val;
     }
-    if (register_name in register_name_aliases_for_cpu_context)
+
+    var name=(""+register_name).toLowerCase();
+    if (name in context && context[name]!==undefined)
     {
-        return context[register_name_aliases_for_cpu_context[register_name]];
+        return context[name];
     }
-    //arm64 32 bit views: w5 holds the low half of x5, and for an address computation the x view is
-    //what we want
-    if (register_name.length>1 && (register_name.charAt(0)==="w" || register_name.charAt(0)==="W"))
+
+    //ARM64 Zero Registers:
+    //Hardware pseudo-registers XZR (64-bit) and WZR (32-bit) read as zero in CPU instructions,
+    //but are not stored as fields in Frida's CpuContext object.
+    if (name==="xzr" || name==="wzr")
     {
-        return context["x"+register_name.substring(1)];
+        return ptr(0);
     }
+
+    //ARM64 Stack Pointer 32-bit view:
+    //WSP represents the lower 32-bits of the 64-bit SP register.
+    if (name==="wsp")
+    {
+        return context.sp ? context.sp.and(ptr("0xffffffff")) : undefined;
+    }
+
+    //Architecture Aliases:
+    //Resolves Capstone architectural names to Frida's CpuContext fields (e.g. x29 -> fp, x30 -> lr).
+    //If the alias is a 32-bit register (starting with 'w'), mask to low 32 bits.
+    if (name in register_name_aliases_for_cpu_context)
+    {
+        var mapped_name=register_name_aliases_for_cpu_context[name];
+        var mapped_val=context[mapped_name];
+        if (mapped_val!==undefined)
+        {
+            if (name.charAt(0)==="w")
+            {
+                return mapped_val.and(ptr("0xffffffff"));
+            }
+            return mapped_val;
+        }
+    }
+
+    //ARM32 Standard Register Aliases:
+    //Frida context objects on ARM32 may expose registers as r0-r15 or fp/ip/sp/lr/pc depending on version.
+    if (name==="fp") { return context.fp!==undefined ? context.fp : context.r11; }
+    if (name==="ip") { return context.ip!==undefined ? context.ip : context.r12; }
+    if (name==="sp") { return context.sp!==undefined ? context.sp : context.r13; }
+    if (name==="lr") { return context.lr!==undefined ? context.lr : context.r14; }
+    if (name==="pc") { return context.pc!==undefined ? context.pc : (context.rip!==undefined ? context.rip : context.eip); }
+
+    //ARM64 General Purpose 32-bit Sub-Registers (w0 - w28):
+    //In ARM64, wN refers to the lower 32-bits of the 64-bit xN register.
+    if (name.length>=2 && name.charAt(0)==="w")
+    {
+        var x_reg="x"+name.substring(1);
+        if (context[x_reg]!==undefined)
+        {
+            return context[x_reg].and(ptr("0xffffffff"));
+        }
+    }
+
+    //x86_64 / x86 32-bit sub-registers on 64-bit context (eax, ebx, ecx, edx, esi, edi, ebp, esp, eip):
+    //On x86_64, reading eax extracts the lower 32-bits of rax. On 32-bit IA32, context[name] matches directly.
+    var x64_parent_32bit={
+        "eax":"rax","ebx":"rbx","ecx":"rcx","edx":"rdx",
+        "esi":"rsi","edi":"rdi","ebp":"rbp","esp":"rsp","eip":"rip"
+    };
+    if (name in x64_parent_32bit)
+    {
+        var parent_x64=x64_parent_32bit[name];
+        if (context[parent_x64]!==undefined)
+        {
+            return context[parent_x64].and(ptr("0xffffffff"));
+        }
+        if (context[name]!==undefined)
+        {
+            return context[name];
+        }
+    }
+
+    //x86_64 Extended 32-bit Registers (r8d - r15d):
+    //Extracts lower 32-bits from full 64-bit r8 - r15 registers.
+    if (name.length>=3 && name.charAt(0)==="r" && name.charAt(name.length-1)==="d")
+    {
+        var full_r_reg=name.substring(0,name.length-1);
+        if (context[full_r_reg]!==undefined)
+        {
+            return context[full_r_reg].and(ptr("0xffffffff"));
+        }
+    }
+
+    //x86 16-bit Sub-Registers (ax, bx, cx, dx, si, di, bp, sp):
+    //Extracts lower 16-bits (mask 0xffff) from parent 64-bit (rax..) or 32-bit (eax..) registers.
+    var x86_parent_16bit={
+        "ax":"rax","bx":"rbx","cx":"rcx","dx":"rdx",
+        "si":"rsi","di":"rdi","bp":"rbp","sp":"rsp"
+    };
+    if (name in x86_parent_16bit)
+    {
+        var p64=x86_parent_16bit[name];
+        if (context[p64]!==undefined) { return context[p64].and(ptr(0xffff)); }
+        var p32="e"+name;
+        if (context[p32]!==undefined) { return context[p32].and(ptr(0xffff)); }
+    }
+
+    //x86_64 Extended 16-bit Registers (r8w - r15w):
+    //Extracts lower 16-bits from r8 - r15.
+    if (name.length>=3 && name.charAt(0)==="r" && name.charAt(name.length-1)==="w")
+    {
+        var full_rw_reg=name.substring(0,name.length-1);
+        if (context[full_rw_reg]!==undefined)
+        {
+            return context[full_rw_reg].and(ptr(0xffff));
+        }
+    }
+
+    //x86 8-bit Low Sub-Registers (al, bl, cl, dl, sil, dil, bpl, spl, r8b - r15b):
+    //Extracts lowest 8-bits (mask 0xff). Note: 2-character names (al..dl) map to eax on 32-bit,
+    //while 3-character names (sil..spl) map to esi..esp.
+    var x86_parent_8bit_low={
+        "al":"rax","bl":"rbx","cl":"rcx","dl":"rdx",
+        "sil":"rsi","dil":"rdi","bpl":"rbp","spl":"rsp"
+    };
+    if (name in x86_parent_8bit_low)
+    {
+        var pl64=x86_parent_8bit_low[name];
+        if (context[pl64]!==undefined) { return context[pl64].and(ptr(0xff)); }
+        var pl32 = name.length === 2 ? "e" + name.charAt(0) + "x" : "e" + name.substring(0, 2);
+        if (context[pl32]!==undefined) { return context[pl32].and(ptr(0xff)); }
+    }
+    if (name.length>=3 && name.charAt(0)==="r" && name.charAt(name.length-1)==="b")
+    {
+        var full_rb_reg=name.substring(0,name.length-1);
+        if (context[full_rb_reg]!==undefined)
+        {
+            return context[full_rb_reg].and(ptr(0xff));
+        }
+    }
+
+    //x86 8-bit High Sub-Registers (ah, bh, ch, dh):
+    //Extracts bits [15:8] by right-shifting 8 bits and masking with 0xff.
+    var x86_parent_8bit_high={"ah":"rax","bh":"rbx","ch":"rcx","dh":"rdx"};
+    if (name in x86_parent_8bit_high)
+    {
+        var ph64=x86_parent_8bit_high[name];
+        if (context[ph64]!==undefined) { return context[ph64].shr(8).and(ptr(0xff)); }
+        var ph32="e"+name.charAt(0)+"x";
+        if (context[ph32]!==undefined) { return context[ph32].shr(8).and(ptr(0xff)); }
+    }
+
     return undefined;
 }
 

@@ -50,7 +50,7 @@ public class DragonHookPlugin extends ProgramPlugin {
     public DragonResetDOSLimitsAction resetDOSlimitsAction;
     public DragonStartHTTPServerAction startHTTPServerAction;
     public DragonStopHTTPServerAction stopHTTPServerAction;
-    public static String  DragonHook_plugin_version="0.1.5";
+    public static String  DragonHook_plugin_version="0.1.6";
 
 
     /**
