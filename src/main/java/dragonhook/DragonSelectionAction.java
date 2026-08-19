@@ -16,6 +16,13 @@ public class DragonSelectionAction extends DockingAction {
 
     protected PluginTool tool;
     protected Program current_program;
+
+    //Called by DragonHookPlugin.programActivated/programDeactivated. Without this the program captured
+    //when the action was constructed was used forever, so after switching program in Ghidra every offset
+    //and every comment went to the WRONG program's database.
+    public void set_current_program(Program incoming_program) {
+        this.current_program=incoming_program;
+    }
     protected ProgramSelection incoming_selection;
     protected Plugin incoming_plugin;
     protected DragonSelectionTaskDispatcher selection_task_dispatcher;
@@ -40,15 +47,22 @@ public class DragonSelectionAction extends DockingAction {
         return pm != null ? pm.getCurrentProgram() : null;
     }
 
+    //A pure predicate. Ghidra calls this constantly - on every context change and every menu build - and
+    //it used to ASSIGN this.incoming_selection as a side effect, so action state was being mutated from an
+    //enablement check.
     @Override
     public boolean isEnabledForContext(ActionContext context) {
-        this.incoming_selection=((ProgramPlugin)incoming_plugin).getProgramSelection();  
-        return (this.incoming_selection!=null && incoming_selection.getNumAddresses()>0);
+        ProgramSelection selection_right_now=((ProgramPlugin)incoming_plugin).getProgramSelection();
+        return (selection_right_now!=null && selection_right_now.getNumAddresses()>0);
     }
 
     @Override
     public void actionPerformed(ActionContext context) {
-        
+
+        //Read the selection HERE rather than trusting whatever the last enablement check happened to
+        //store. That is also more correct: the selection can change between the menu being built and the
+        //menu item being clicked.
+        this.incoming_selection=((ProgramPlugin)incoming_plugin).getProgramSelection();
         CreatorOfNecessaryFiles.createAllNecessaryFiles();
         this.current_program = (this.current_program==null) ? getCurrentProgram() : this.current_program;
         JSAgentPreparer.prepare_agent_file_if_not_already_prepared(this.current_program);

@@ -98,7 +98,15 @@ function return_register_value_from_context(context,register_name)
     //Frida context objects on ARM32 may expose registers as r0-r15 or fp/ip/sp/lr/pc depending on version.
     if (name==="fp") { return context.fp!==undefined ? context.fp : context.r11; }
     if (name==="ip") { return context.ip!==undefined ? context.ip : context.r12; }
-    if (name==="sp") { return context.sp!==undefined ? context.sp : context.r13; }
+    //"sp" is the one name that means different things on different architectures: the arm stack pointer,
+    //but on x86 the 16 bit view of rsp/esp. Returning unconditionally here meant that on x86, where
+    //neither context.sp nor context.r13 exists, the answer was undefined and the 16 bit table further
+    //down - which does map "sp" to rsp - was never reached. So fall through instead of returning.
+    if (name==="sp")
+    {
+        if (context.sp!==undefined) { return context.sp; }
+        if (context.r13!==undefined) { return context.r13; }
+    }
     if (name==="lr") { return context.lr!==undefined ? context.lr : context.r14; }
     if (name==="pc") { return context.pc!==undefined ? context.pc : (context.rip!==undefined ? context.rip : context.eip); }
 
@@ -263,7 +271,10 @@ function extract_function_info_from_address_for_our_module_with_live_api_calls(i
     }
     //this path used to fail completely silently, so a DOS limit or an invalid offset looked
     //identical to "ghidra has no function there"
-    console.log("LIVE LOOKUP MISS for module offset "+offset_of_addr_str+" , ghidra replied: "+returned_str_from_ghidra_api);
+    //Deliberately does NOT say "ghidra replied": the value can be an agent side error string that ghidra never
+    //saw, which is what get_function_data_from_ghidra_given_address_offset() returns when the channel to python
+    //is gone. Attributing that to ghidra sends whoever reads the log looking in the wrong process.
+    console.log("LIVE LOOKUP MISS for module offset "+offset_of_addr_str+" , the lookup returned: "+returned_str_from_ghidra_api);
     return null;
 }
 
@@ -359,7 +370,12 @@ function extract_succinct_str_for_address(in_addr)
     else
     {
         var debugsymbol_data=extract_DebugSymbol_fromAddress_data(in_addr)
-        return debugsymbol_data.toString().split(" ").slice(1).toString()
+        //join(" ") and not toString(): Array.toString() joins with COMMAS, so dropping the leading
+        //address turned "0x7f.. libc.so!printf + 0x10" into "libc.so!printf,+,0x10". Nothing parses this
+        //string - it goes into a call trace line that is only printed - so putting the spaces back is
+        //safe, and it also makes the replaceAll(",","_") in process_call_ret_stalk_event() a no-op
+        //instead of a mangling step.
+        return debugsymbol_data.toString().split(" ").slice(1).join(" ")
     }
 }
 

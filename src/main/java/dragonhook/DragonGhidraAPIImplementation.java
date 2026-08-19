@@ -5,6 +5,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import dragonhook.util.DOSLimitsTracker;
@@ -21,6 +22,7 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.symbol.FlowType;
 import ghidra.program.model.symbol.MemReferenceImpl;
@@ -33,7 +35,11 @@ import ghidra.program.model.symbol.SourceType;
 public class DragonGhidraAPIImplementation {
 
     protected PluginTool tool;
-    protected Program current_program;
+    //volatile: written from the SWING thread by set_current_program() when the user switches program, read
+    //by the HTTP server's dispatcher thread on every request. Without it there is no guarantee the server
+    //thread ever observes the new program, which would silently defeat the whole retargeting mechanism -
+    //the server would keep writing into the database of the program that was open when it started.
+    protected volatile Program current_program;
     protected Plugin incoming_plugin;
     long max_displacement;
     //https://ghidra.re/ghidra_docs/api/ghidra/program/model/symbol/RefType.html
@@ -41,6 +47,14 @@ public class DragonGhidraAPIImplementation {
     RefType[] valid_reftypes= {RefType.CALL_OVERRIDE_UNCONDITIONAL,RefType.CALL_TERMINATOR,RefType.CALLOTHER_OVERRIDE_CALL,RefType.CALLOTHER_OVERRIDE_JUMP,RefType.COMPUTED_CALL,RefType.COMPUTED_CALL_TERMINATOR,RefType.COMPUTED_JUMP,RefType.CONDITIONAL_CALL,RefType.CONDITIONAL_CALL_TERMINATOR,RefType.CONDITIONAL_COMPUTED_CALL,RefType.CONDITIONAL_COMPUTED_JUMP,RefType.CONDITIONAL_JUMP,RefType.CONDITIONAL_TERMINATOR,RefType.DATA,RefType.EXTERNAL_REF,RefType.FALL_THROUGH,RefType.FLOW,RefType.INDIRECTION,RefType.INVALID,RefType.JUMP_OVERRIDE_UNCONDITIONAL,RefType.JUMP_TERMINATOR,RefType.PARAM,RefType.READ,RefType.READ_IND,RefType.READ_WRITE,RefType.READ_WRITE_IND,RefType.TERMINATOR,RefType.THUNK,RefType.UNCONDITIONAL_CALL,RefType.UNCONDITIONAL_JUMP,RefType.WRITE,RefType.WRITE_IND};
 
     
+    //The HTTP server's handlers capture this object when the contexts are created, so when the user switches
+    //program in Ghidra the running server has to be retargeted or it keeps serving the old one - writing
+    //comments and xrefs into the wrong database. Called from DragonStartHTTPServerAction.
+    public void set_current_program(Program incoming_program)
+    {
+        this.current_program=incoming_program;
+    }
+
     public DragonGhidraAPIImplementation(Plugin plugin, Program current_program) {
         this.tool = plugin.getTool();
         this.current_program = current_program;
@@ -55,8 +69,14 @@ public class DragonGhidraAPIImplementation {
             Pattern.compile("[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_]");
     private static final Pattern pattern_for_instruction_text=
             Pattern.compile("[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_\\ \\,\\!\\+\\-\\#\\[\\]\\:\\.\\(\\)\\~\\$]");
+    //"<" and ">" are allowed so that C++ template names survive: foo<int> used to become foo_int_, which
+    //does not match anything the user sees in ghidra. They are safe here because a function name only ever
+    //travels inside a JSON string (parsed with JSON.parse on the agent side, so markup means nothing) and
+    //into a ghidra listing comment, which is plain text and not HTML. The characters that WOULD matter are
+    //the quote, the backslash and the pipe - the quote and backslash would break the JSON, and the pipe
+    //would break the |||DH_GHIDRA_API_CALL||| framing - and this is a whitelist, so all three stay excluded.
     private static final Pattern pattern_for_function_name=
-            Pattern.compile("[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_\\~\\:\\$]");
+            Pattern.compile("[^0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_\\~\\:\\$\\<\\>]");
 
     public static String sanitize_str(String incoming_str)
     {
@@ -199,12 +219,12 @@ public class DragonGhidraAPIImplementation {
                 return "Error, maximum allowed times to call the FUN_DATA_GIVEN_ADDR_OFFSET is 0";
             }
             
-            if (DOSLimitsTracker.map_of_codeunits_for_which_function_data_have_been_returned.containsKey(target_codeunit))
+            if (DOSLimitsTracker.map_of_codeunits_for_which_function_data_have_been_returned.containsKey(target_codeunit.getMinAddress()))
             {
-                int times_returned=DOSLimitsTracker.map_of_codeunits_for_which_function_data_have_been_returned.get(target_codeunit);
+                int times_returned=DOSLimitsTracker.map_of_codeunits_for_which_function_data_have_been_returned.get(target_codeunit.getMinAddress());
                 if (times_returned<DOSLimitsTracker.allowed_times_FUN_DATA_GIVEN_ADDR_OFFSET)
                 {
-                    DOSLimitsTracker.map_of_codeunits_for_which_function_data_have_been_returned.put(target_codeunit,times_returned+1);
+                    DOSLimitsTracker.map_of_codeunits_for_which_function_data_have_been_returned.put(target_codeunit.getMinAddress(),times_returned+1);
                 }
                 else
                 {
@@ -213,7 +233,7 @@ public class DragonGhidraAPIImplementation {
             }
             else
             {
-                DOSLimitsTracker.map_of_codeunits_for_which_function_data_have_been_returned.put(target_codeunit,1);
+                DOSLimitsTracker.map_of_codeunits_for_which_function_data_have_been_returned.put(target_codeunit.getMinAddress(),1);
             }
         }
         
@@ -269,8 +289,30 @@ public class DragonGhidraAPIImplementation {
 
     public String ALL_FUN_DATA_SORTED_BY_RANGESTART()
     {
+        //This check was missing while every other endpoint had it, and closing a program while an agent runs
+        //made the line below throw a NullPointerException INSIDE the http handler. The handler then never
+        //called provide_httpserver_reply(), the exchange was never closed, and the agent's blocking
+        //recv().wait() never got a reply - hanging that target thread for the life of the process.
+        if (this.current_program==null)
+        {
+            return "Error, current Program is null";
+        }
+
+        //The per-agent-run call limit is enforced HERE as well as in the endpoint, so that the limit cannot
+        //be bypassed by any other caller of this method.
+        if (DOSLimitsTracker.allowed_times_ALL_FUN_DATA_SORTED_BY_RANGESTART<=0)
+        {
+            return "The ALL_FUN_DATA_SORTED_BY_RANGESTART endpoint is not allowed to be called.";
+        }
+        if (DOSLimitsTracker.number_of_times_ALL_FUN_DATA_SORTED_BY_RANGESTART_has_been_called
+                >DOSLimitsTracker.allowed_times_ALL_FUN_DATA_SORTED_BY_RANGESTART)
+        {
+            return "The ALL_FUN_DATA_SORTED_BY_RANGESTART endpoint has reached the maximum amount of times to be called per agent execution.";
+        }
+
         long time_at_start=System.nanoTime();
         long image_base_offset=current_program.getImageBase().getOffset();
+        long number_of_functions_below_the_image_base=0;
         ArrayList<String> function_entries=new ArrayList<String>();   //index -> ["name","0xentrypoint"]
         ArrayList<long[]> range_entries=new ArrayList<long[]>();      //{start, end, index into function_entries}
 
@@ -279,8 +321,18 @@ public class DragonGhidraAPIImplementation {
         {
             Function current_function=fun_iter.next();
             String name_of_fun=sanitize_fun_name(current_function.getName(true));
+            //A program can hold memory blocks BELOW its image base, which makes the offset negative.
+            //Long.toHexString() then renders it as sixteen hex digits starting with f, the agent does
+            //ptr() on that and gets an enormous value, and every "function+delta" it prints in a comment is
+            //nonsense. Skip such a function rather than emit an entry that can only mislead.
+            long entrypoint_offset_of_function=current_function.getEntryPoint().getOffset() - image_base_offset;
+            if (entrypoint_offset_of_function<0)
+            {
+                number_of_functions_below_the_image_base+=1;
+                continue;
+            }
             //inlined instead of return_offset_for_addr(), which re-reads the image base every call
-            String start_of_fun_offset="0x"+Long.toHexString(current_function.getEntryPoint().getOffset() - image_base_offset);
+            String start_of_fun_offset="0x"+Long.toHexString(entrypoint_offset_of_function);
             int index_of_this_function=function_entries.size();
             function_entries.add("[\""+name_of_fun+"\",\""+start_of_fun_offset+"\"]");
 
@@ -288,10 +340,13 @@ public class DragonGhidraAPIImplementation {
             while (current_function_ranges_iter!=null && current_function_ranges_iter.hasNext())
             {
                 AddressRange current_function_range=current_function_ranges_iter.next();
-                range_entries.add(new long[]{
-                        current_function_range.getMinAddress().getOffset() - image_base_offset,
-                        current_function_range.getMaxAddress().getOffset() - image_base_offset,
-                        index_of_this_function});
+                long start_offset_of_range=current_function_range.getMinAddress().getOffset() - image_base_offset;
+                long end_offset_of_range=current_function_range.getMaxAddress().getOffset() - image_base_offset;
+                if (start_offset_of_range<0 || end_offset_of_range<0)
+                {
+                    continue;   //same reason as the entry point above
+                }
+                range_entries.add(new long[]{start_offset_of_range,end_offset_of_range,index_of_this_function});
             }
         }
 
@@ -326,6 +381,12 @@ public class DragonGhidraAPIImplementation {
         String retval=sb.toString();
 
         long time_at_end=System.nanoTime();
+        if (number_of_functions_below_the_image_base>0)
+        {
+            System.out.println("ALL_FUN_DATA_SORTED_BY_RANGESTART: skipped "+number_of_functions_below_the_image_base
+                    +" function(s) that live below the image base, because a negative module offset cannot be"
+                    +" expressed in the table the agent looks up.");
+        }
         System.out.println("ALL_FUN_DATA_SORTED_BY_RANGESTART: "+function_entries.size()+" functions, "
                 +range_entries.size()+" ranges, "+retval.length()+" chars. Gathering from ghidra took "
                 +((time_after_gathering-time_at_start)/1000000)+" ms, serialising took "
@@ -367,12 +428,12 @@ public class DragonGhidraAPIImplementation {
             return "Error, maximum comment limit for codeunits is 0";
         }
         
-        if (DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.containsKey(target_codeunit))
+        if (DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.containsKey(target_codeunit.getMinAddress()))
         {
-            int times_updated=DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.get(target_codeunit);
+            int times_updated=DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.get(target_codeunit.getMinAddress());
             if (times_updated<DOSLimitsTracker.max_comments_per_codeunit_for_each_agent_run)
             {
-                DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.put(target_codeunit,times_updated+1);
+                DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.put(target_codeunit.getMinAddress(),times_updated+1);
             }
             else
             {
@@ -381,21 +442,13 @@ public class DragonGhidraAPIImplementation {
         }
         else
         {
-            DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.put(target_codeunit,1);
+            DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.put(target_codeunit.getMinAddress(),1);
         }
         
         //update the comment
-        
+
         String oldcomment=target_codeunit.getComment(CommentType.PRE); //use CodeUnit.PRE_COMMENT in previous ghidra versions
-        String newcomment="";
-        if (oldcomment==null)
-        {
-            newcomment=comment;
-        }
-        else
-        {
-            newcomment=oldcomment+"\n"+comment;
-        }
+        String newcomment=merge_comment_into_existing_comment(oldcomment,comment);
 
         try
         {
@@ -423,6 +476,80 @@ public class DragonGhidraAPIImplementation {
     
     
     
+    //Matches a line that already carries a repeat marker, so "Calls foo (x3)" is recognised as three
+    //occurrences of "Calls foo" rather than as a different line.
+    private static final Pattern pattern_for_repeat_marker_at_end_of_line=Pattern.compile("^(.*?)\\s*\\(x(\\d+)\\)$");
+
+    //Appends a comment, collapsing an immediate repeat into a "(xN)" counter instead of writing the same
+    //sentence again. Comments used to be appended unconditionally, so re-running a feature produced
+    //byte-identical duplicates and a hot address ended up with fifteen copies of one line.
+    //
+    //Only the LAST line is considered, deliberately. Line order carries meaning here - the comments are a
+    //chronological record of what the agent observed - so if the same text appears earlier but something
+    //else has been written since, it is appended as a new line rather than merged backwards. That keeps
+    //"A, B, A" distinguishable from "A (x2), B".
+    public static String merge_comment_into_existing_comment(String existing_comment, String comment_to_add)
+    {
+        if (comment_to_add==null)
+        {
+            return (existing_comment==null) ? "" : existing_comment;
+        }
+        //the agent frequently terminates its comments with a newline
+        String trimmed_comment_to_add=comment_to_add.replaceAll("[\\r\\n]+$","");
+        if (existing_comment==null || existing_comment.isEmpty())
+        {
+            return trimmed_comment_to_add;
+        }
+        //A multi line addition has no single "previous line" to compare against, so merging it would be
+        //guesswork. Append it as it is.
+        if (trimmed_comment_to_add.contains("\n"))
+        {
+            return existing_comment+"\n"+trimmed_comment_to_add;
+        }
+
+        String[] existing_lines=existing_comment.split("\n",-1);
+        int index_of_last_line=existing_lines.length-1;
+        //tolerate a trailing empty line in what is already stored
+        while (index_of_last_line>0 && existing_lines[index_of_last_line].isEmpty())
+        {
+            index_of_last_line-=1;
+        }
+        String last_line=existing_lines[index_of_last_line];
+
+        String base_text_of_last_line=last_line;
+        int times_the_last_line_already_occurred=1;
+        Matcher matcher_for_repeat=pattern_for_repeat_marker_at_end_of_line.matcher(last_line);
+        if (matcher_for_repeat.matches())
+        {
+            base_text_of_last_line=matcher_for_repeat.group(1);
+            try
+            {
+                times_the_last_line_already_occurred=Integer.parseInt(matcher_for_repeat.group(2));
+            }
+            catch (NumberFormatException e)
+            {
+                //a literal "(x...)" that is not a counter, treat the whole line as the text
+                base_text_of_last_line=last_line;
+                times_the_last_line_already_occurred=1;
+            }
+        }
+
+        if (!base_text_of_last_line.equals(trimmed_comment_to_add))
+        {
+            return existing_comment+"\n"+trimmed_comment_to_add;   //a different line, order is preserved
+        }
+
+        existing_lines[index_of_last_line]=base_text_of_last_line+" (x"+(times_the_last_line_already_occurred+1)+")";
+        StringBuilder sb=new StringBuilder();
+        for (int i=0;i<existing_lines.length;i++)
+        {
+            if (i>0) { sb.append("\n"); }
+            sb.append(existing_lines[i]);
+        }
+        return sb.toString();
+    }
+
+
     public String UPDATE_GHIDRADB_WITH_XREF(long address_offset_from,long address_offset_to, String type_of_xref, boolean apply_DOS_limits)
     {
         String retval="";
@@ -482,7 +609,13 @@ public class DragonGhidraAPIImplementation {
         }
  
         
-        //check for limits
+        //check for limits.
+        //These used to consult map_of_codeunits_that_are_updated_with_comment while comparing against
+        //max_xrefs_per_codeunit_for_each_agent_run, so comments and xrefs shared ONE counter per address
+        //and map_of_codeunits_that_are_updated_with_xref was never touched at all. Since every feature
+        //writes a comment AND an xref for the same address, that counter was consumed twice as fast and
+        //you got roughly half of each configured limit - and setting the two limits independently did
+        //nothing, because whichever check reached the shared counter first won.
         if (apply_DOS_limits)
         {
             if (DOSLimitsTracker.max_xrefs_per_codeunit_for_each_agent_run==0)
@@ -490,12 +623,12 @@ public class DragonGhidraAPIImplementation {
                 return "Error, maximum xref limit for codeunits is 0";
             }
             
-            if (DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.containsKey(target_codeunit_from))
+            if (DOSLimitsTracker.map_of_codeunits_that_are_updated_with_xref.containsKey(target_codeunit_from.getMinAddress()))
             {
-                int times_updated=DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.get(target_codeunit_from);
+                int times_updated=DOSLimitsTracker.map_of_codeunits_that_are_updated_with_xref.get(target_codeunit_from.getMinAddress());
                 if (times_updated<DOSLimitsTracker.max_xrefs_per_codeunit_for_each_agent_run)
                 {
-                    DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.put(target_codeunit_from,times_updated+1);
+                    DOSLimitsTracker.map_of_codeunits_that_are_updated_with_xref.put(target_codeunit_from.getMinAddress(),times_updated+1);
                 }
                 else
                 {
@@ -504,15 +637,15 @@ public class DragonGhidraAPIImplementation {
             }
             else
             {
-                DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.put(target_codeunit_from,1);
+                DOSLimitsTracker.map_of_codeunits_that_are_updated_with_xref.put(target_codeunit_from.getMinAddress(),1);
             }
             
-            if (DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.containsKey(target_codeunit_to))
+            if (DOSLimitsTracker.map_of_codeunits_that_are_updated_with_xref.containsKey(target_codeunit_to.getMinAddress()))
             {
-                int times_updated=DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.get(target_codeunit_to);
+                int times_updated=DOSLimitsTracker.map_of_codeunits_that_are_updated_with_xref.get(target_codeunit_to.getMinAddress());
                 if (times_updated<DOSLimitsTracker.max_xrefs_per_codeunit_for_each_agent_run)
                 {
-                    DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.put(target_codeunit_to,times_updated+1);
+                    DOSLimitsTracker.map_of_codeunits_that_are_updated_with_xref.put(target_codeunit_to.getMinAddress(),times_updated+1);
                 }
                 else
                 {
@@ -521,7 +654,7 @@ public class DragonGhidraAPIImplementation {
             }
             else
             {
-                DOSLimitsTracker.map_of_codeunits_that_are_updated_with_comment.put(target_codeunit_to,1);
+                DOSLimitsTracker.map_of_codeunits_that_are_updated_with_xref.put(target_codeunit_to.getMinAddress(),1);
             }
         }
         
@@ -585,12 +718,12 @@ public class DragonGhidraAPIImplementation {
             return "Error, the endpoint CODEUNIT_DATA_GIVEN_ADDR_OFFSET is not allowed to be called";
         }
         
-        if (DOSLimitsTracker.map_of_codeunits_for_which_codeunit_data_has_been_returned.containsKey(target_codeunit))
+        if (DOSLimitsTracker.map_of_codeunits_for_which_codeunit_data_has_been_returned.containsKey(target_codeunit.getMinAddress()))
         {
-            int times_returned=DOSLimitsTracker.map_of_codeunits_for_which_codeunit_data_has_been_returned.get(target_codeunit);
+            int times_returned=DOSLimitsTracker.map_of_codeunits_for_which_codeunit_data_has_been_returned.get(target_codeunit.getMinAddress());
             if (times_returned<DOSLimitsTracker.allowed_times_CODEUNIT_DATA_GIVEN_ADDR_OFFSET)
             {
-                DOSLimitsTracker.map_of_codeunits_for_which_codeunit_data_has_been_returned.put(target_codeunit,times_returned+1);
+                DOSLimitsTracker.map_of_codeunits_for_which_codeunit_data_has_been_returned.put(target_codeunit.getMinAddress(),times_returned+1);
             }
             else
             {
@@ -599,7 +732,7 @@ public class DragonGhidraAPIImplementation {
         }
         else
         {
-            DOSLimitsTracker.map_of_codeunits_for_which_codeunit_data_has_been_returned.put(target_codeunit,1);
+            DOSLimitsTracker.map_of_codeunits_for_which_codeunit_data_has_been_returned.put(target_codeunit.getMinAddress(),1);
         }
         
                 
@@ -779,15 +912,29 @@ public class DragonGhidraAPIImplementation {
             return "Error, length_of_array==0";
         }
         
-        Address maxaddr=this.current_program.getMaxAddress(); //does not work. do not use. Its offset is all over the place.
-        long memsize=program_mem.getSize();
-        
-        
-        long difference_in_size=(image_base.getOffset()+memsize) - target_addr.getOffset();
-        
-        if (difference_in_size<length_of_array)
+        //Bound the write by the memory BLOCK that contains the target, not by image_base+Memory.getSize().
+        //getSize() is the total number of bytes across all blocks, so treating it as the distance from the
+        //image base assumes one contiguous region - false for almost any real program, which has .text,
+        //.data and often blocks far away from each other. It happened to fail safe, because setBytes()
+        //throws on unmapped memory and the transaction rolls back, but it was accepting and rejecting on a
+        //meaningless number. The containing block gives the exact answer, and also catches a write that
+        //starts inside a block and runs off its end into a gap.
+        MemoryBlock block_containing_target=program_mem.getBlock(target_addr);
+        if (block_containing_target==null)
         {
-            return "Error, attempting to write past the program end";
+            return "Error, the target address does not fall inside any memory block of the program";
+        }
+        if (!block_containing_target.isInitialized())
+        {
+            return "Error, the target address is inside an uninitialized memory block, its bytes cannot be set";
+        }
+        long bytes_available_until_the_end_of_the_block=
+                block_containing_target.getEnd().getOffset() - target_addr.getOffset() + 1;
+        if (bytes_available_until_the_end_of_the_block<length_of_array)
+        {
+            return "Error, the write of "+length_of_array+" bytes would run past the end of the memory block \""
+                    +block_containing_target.getName()+"\", which has only "
+                    +bytes_available_until_the_end_of_the_block+" bytes left from this address";
         }
         
         //write the memory

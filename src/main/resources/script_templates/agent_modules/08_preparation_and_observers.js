@@ -40,7 +40,25 @@ var observer_KYjQgb = Process.attachModuleObserver({
                 module_to_hook_endaddr=module_to_hook_baseaddr.add(module_to_hook_size);
                 module_to_hook_obj=module;
                 is_module_to_hook_loaded=true;
-                intercept_identified_module_DragonHook();
+                if (our_module_has_been_unloaded_at_least_once)
+                {
+                    //A RELOAD, after handle_our_module_being_unloaded() tore everything down. The bounds
+                    //recorded just above are the NEW ones, so stalking can restart correctly - the feature
+                    //tables hold offsets relative to the module and are therefore still valid at a
+                    //different base.
+                    //The Interceptor hooks are deliberately NOT re-installed: attaching to the same
+                    //function twice gives two hooks and therefore duplicated output, and the hooks from
+                    //the previous load were left dangling when the module was unmapped. If hooks matter
+                    //for what you are doing, re-run the agent rather than trusting this session.
+                    console.log("DragonHook: "+module_name_to_hook+" has been loaded AGAIN, at "
+                        +module_to_hook_baseaddr+". Stalking restarts against the new base. Interceptor"
+                        +" hooks are NOT re-installed - re-run the agent if you need them.");
+                    begin_stalking_as_soon_as_module_is_found();
+                }
+                else
+                {
+                    intercept_identified_module_DragonHook();
+                }
             }
             else
             {
@@ -60,7 +78,18 @@ var observer_KYjQgb = Process.attachModuleObserver({
     },
     onRemoved(module) {
         //console.log('Module '+module.path+' was  unloaded');
+        //Compare by BASE ADDRESS, not by name. Two modules can share a name, and by the time this fires
+        //the name is the only thing left to go on for anything else - but the base is what identifies the
+        //mapping we recorded.
+        var this_is_our_module=(is_module_to_hook_loaded
+            && module_to_hook_baseaddr!=null
+            && !module_to_hook_baseaddr.isNull()
+            && module.base.equals(module_to_hook_baseaddr));
         modulemap_for_all_modules.update();
+        if (this_is_our_module)
+        {
+            handle_our_module_being_unloaded();
+        }
     }
 });
 
@@ -70,38 +99,47 @@ var threadobserver_KYjQgb = Process.attachThreadObserver({
         {
             dict_from_threadids_to_threads[thread.id.toString()]=thread;
             
-            if (thread.name && !should_this_thread_be_stalked(thread) ) 
+            //No "thread.name &&" guard any more. should_this_thread_be_stalked() decides primarily from
+            //the thread's ENTRYPOINT, which is exactly what works when the name is still null - and a
+            //thread's name is usually set a moment AFTER creation, so the old guard skipped the
+            //entrypoint test for precisely the threads it existed to catch, letting frida's own unnamed
+            //threads be stalked. The name test remains inside as the fallback, and it treats a missing
+            //name as "stalk it".
+            if (!should_this_thread_be_stalked(thread))
             {
-                return; //do nothing in this case
+                return; //frida's own thread, or one excluded by the thread name blacklist
             }
             
-            //STALKER 
-            var str_to_be_included_in_thread_name_for_stalker=""; //UPDATED FROM DRAGONHOOK PLUGIN
-            var there_is_a_restriction_for_the_thread_name_for_stalker=false;  //UPDATED FROM DRAGONHOOK PLUGIN
-            
+            //STALKER
             //be careful when stalking everything, depending on the application the thread list may need to be restricted. For example,in Android Unity applications, UnityMain is the name of the thread that must be stalked .
-            if ((is_generally_stalking_enabled) && 
-                ((!there_is_a_restriction_for_the_thread_name_for_stalker) ||
-                (there_is_a_restriction_for_the_thread_name_for_stalker && thread.name &&  thread.name.toLowerCase().includes(str_to_be_included_in_thread_name_for_stalker) ) )
-               )   
+            //The restriction itself now lives at module scope, so that onRenamed can re-evaluate it: a
+            //thread is usually named a moment AFTER it is created, so testing the name here alone
+            //rejected precisely the threads the option exists to select.
+            if (is_generally_stalking_enabled && does_thread_pass_the_stalker_name_restriction(thread))
             {
-                console.log("Tryng to start stalking thread "+thread.id+" with name "+thread.name)
-                //note: maybe the module to be stalked has not even been loaded yet
-                dict_with_threadIds_call_traces[thread.id.toString()]=[];
-                startStalker(thread.id, modulename_to_stalk)   //owns the followed-flag itself now
-                console.log("Began stalking thread "+thread.id+" with name "+thread.name)
+                if (should_following_this_thread_wait_for_our_module())
+                {
+                    //Our module is not loaded yet, so following now would compile blocks that both
+                    //transforms refuse to instrument, and Stalker would cache those empty copies for ever.
+                    //Wait instead: the follow happens from begin_stalking_as_soon_as_module_is_found(),
+                    //once the flags, the feature tables and the module exclusions are all in place.
+                    console.log("Queueing thread "+thread.id+" ("+thread.name+") for stalking, "
+                        +modulename_to_stalk+" has not been found yet");
+                    queue_thread_for_stalking_when_our_module_is_found(thread.id);
+                }
+                else
+                {
+                    console.log("Tryng to start stalking thread "+thread.id+" with name "+thread.name)
+                    dict_with_threadIds_call_traces[thread.id.toString()]=[];
+                    startStalker(thread.id, modulename_to_stalk)   //owns the followed-flag itself now
+                    console.log("Began stalking thread "+thread.id+" with name "+thread.name)
+                }
             }
             
             
             
             // WATCHPOINTS
-            var str_to_be_included_in_thread_name_for_watchpoints=""; //UPDATED FROM DRAGONHOOK PLUGIN
-            var there_is_a_restriction_for_the_thread_name_for_watchpoints=false;  //UPDATED FROM DRAGONHOOK PLUGIN
-            
-            if (setting_of_watchpoints_is_enabled && 
-                ((!there_is_a_restriction_for_the_thread_name_for_watchpoints) ||
-               (there_is_a_restriction_for_the_thread_name_for_watchpoints && thread.name &&  thread.name.toLowerCase().includes(str_to_be_included_in_thread_name_for_watchpoints) ) )
-               ) 
+            if (setting_of_watchpoints_is_enabled && does_thread_pass_the_watchpoint_name_restriction(thread))
             {
                 if (is_module_to_hook_loaded)
                 {
@@ -113,7 +151,7 @@ var threadobserver_KYjQgb = Process.attachThreadObserver({
                 else
                 {
                     //enqueue the thread so that the watchpoint will be installed as soon as the module is loaded
-                    queue_of_threads_for_which_watchpoint_will_be_added_when_the_module_is_loaded.push(thread);
+                    threadids_queued_for_watchpoint_installation[thread.id.toString()]=true;
                 }
                 
             }
@@ -125,13 +163,15 @@ var threadobserver_KYjQgb = Process.attachThreadObserver({
             
             if (is_generally_stalking_enabled)
             {
+                //one property delete, no scan of the queue
+                delete threadids_queued_for_stalking[thread.id.toString()];
                 stopStalker(thread.id)
             }
             
             if (setting_of_watchpoints_is_enabled)
             {
-                //remove thread from queue
-                queue_of_threads_for_which_watchpoint_will_be_added_when_the_module_is_loaded= queue_of_threads_for_which_watchpoint_will_be_added_when_the_module_is_loaded.filter(item => item !== thread)
+                //one property delete, no scan of the queue
+                delete threadids_queued_for_watchpoint_installation[thread.id.toString()];
                 forget_watchpoint_bookkeeping_for_thread(thread.id.toString());
             }
         },
@@ -150,10 +190,52 @@ var threadobserver_KYjQgb = Process.attachThreadObserver({
                 dict_with_threadIds_that_are_being_stalked[thread.id.toString()]=false;
             }
 
+            //A thread's name almost always arrives AFTER it was created, so a name restriction evaluated
+            //in onAdded saw null and rejected the very threads it exists to select - "only stalk threads
+            //called UnityMain" matched nothing at all on a target that names its threads late, which is
+            //most of them. onRenamed could previously only ever STOP stalking, never start it, so there
+            //was no second chance. Re-evaluate here and start the thread if it now qualifies.
+            if (is_generally_stalking_enabled
+                && should_this_thread_be_stalked(thread)
+                && does_thread_pass_the_stalker_name_restriction(thread)
+                && dict_with_threadIds_that_are_being_stalked[thread.id.toString()]!==true
+                && !(thread.id.toString() in threadids_queued_for_stalking))
+            {
+                console.log("Thread "+thread.id+" now matches the thread name restriction after being renamed to \""
+                    +thread.name+"\", starting it");
+                if (should_following_this_thread_wait_for_our_module())
+                {
+                    queue_thread_for_stalking_when_our_module_is_found(thread.id);
+                }
+                else
+                {
+                    dict_with_threadIds_call_traces[thread.id.toString()]=[];
+                    startStalker(thread.id, modulename_to_stalk);
+                }
+            }
+
+            //the same second chance for watchpoints, which had the identical structure and the identical gap
+            if (setting_of_watchpoints_is_enabled
+                && should_this_thread_be_stalked(thread)
+                && does_thread_pass_the_watchpoint_name_restriction(thread)
+                && !do_we_have_any_watchpoint_bookkeeping_for_thread(thread.id.toString())
+                && !(thread.id.toString() in threadids_queued_for_watchpoint_installation))
+            {
+                console.log("Thread "+thread.id+" now matches the watchpoint thread name restriction after being"
+                    +" renamed to \""+thread.name+"\", installing watchpoints on it");
+                if (is_module_to_hook_loaded)
+                {
+                    schedule_watchpoint_installation_for_a_thread(thread);
+                }
+                else
+                {
+                    threadids_queued_for_watchpoint_installation[thread.id.toString()]=true;
+                }
+            }
+
             if (setting_of_watchpoints_is_enabled && !should_this_thread_be_stalked(thread))
             {
-                queue_of_threads_for_which_watchpoint_will_be_added_when_the_module_is_loaded=
-                    queue_of_threads_for_which_watchpoint_will_be_added_when_the_module_is_loaded.filter(item => item !== thread);
+                delete threadids_queued_for_watchpoint_installation[thread.id.toString()];
                 //deferred for exactly the same reason as installation: unsetHardwareWatchpoint() also
                 //has to stop and resume the thread to reach its debug registers, and this callback
                 //runs on a target thread. Calling it inline blocks.

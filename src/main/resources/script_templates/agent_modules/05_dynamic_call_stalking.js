@@ -9,12 +9,42 @@ var maximum_times_to_log_call_target=1; // UPDATED FROM DRAGONHOOK PLUGIN
 var dynamic_call_stalking_to_use_builtin_method=true; // UPDATED FROM DRAGONHOOK PLUGIN
 var is_generally_stalking_enabled=false; //will be updated during runtime
 
+//The user's "only stalk threads whose name contains X" restriction. Declared HERE, at module scope, and
+//not inside the thread observer's onAdded where they used to live, because onRenamed has to consult them
+//too - see does_thread_pass_the_stalker_name_restriction().
+var str_to_be_included_in_thread_name_for_stalker=""; //UPDATED FROM DRAGONHOOK PLUGIN
+var there_is_a_restriction_for_the_thread_name_for_stalker=false;  //UPDATED FROM DRAGONHOOK PLUGIN
+
+
+//Whether a thread satisfies the user's thread NAME restriction, as opposed to should_this_thread_be_stalked()
+//which decides whether it is one of frida's own.
+//Returns false for a thread with no name yet: we genuinely cannot tell, and the thread observer's
+//onRenamed re-asks the moment a name appears.
+//Called from the thread observer, in both onAdded and onRenamed.
+function does_thread_pass_the_stalker_name_restriction(thread)
+{
+    if (!there_is_a_restriction_for_the_thread_name_for_stalker)
+    {
+        return true;   //no restriction, every thread qualifies
+    }
+    if (!thread || !thread.name)
+    {
+        return false;
+    }
+    return thread.name.toLowerCase().includes(str_to_be_included_in_thread_name_for_stalker);
+}
+
 var offsets_of_dynamic_calls={"DRAGONHOOK_OFFSETS_OF_DYNAMIC_CALLS":true}; //populated through ghidra
 var dict_with_threadIds_and_whether_to_stalk_non_calls={};
 var dict_with_threadIds_that_are_being_stalked={};
 
 var call_tracing_through_stalker_is_enabled=false; // UPDATED FROM DRAGONHOOK PLUGIN
 var call_tracing_ignore_callrets_outside_our_module=true; // UPDATED FROM DRAGONHOOK PLUGIN
+//Trace calls from the moment the agent loads, rather than waiting for the examined module to appear.
+//Only meaningful while call_tracing_ignore_callrets_outside_our_module is false, because the filter it
+//controls is the only thing in the receiver that needs our module's bounds.
+var call_tracing_before_our_module_is_loaded=false; // UPDATED FROM DRAGONHOOK PLUGIN
+var the_early_call_tracing_notice_has_been_printed=false;
 var dict_with_threadIds_call_traces={};
 
 var stalker_cleanup_delay_ms=5000;          //how long to wait before reclaiming
@@ -188,8 +218,20 @@ function stalker_follow_dynamic_calls_marking_threads_method(threadId)
                     {
                         //let, for the same reason as offset_str above
                         let marker_value=ghidra_base_addr.add(instruction.address.sub(baseaddr_of_modulename_to_stalk));
+                        //captured for the Stalker.invalidate() below, for the same closure reason again
+                        let address_of_this_dynamic_call=instruction.address;
                         iterator.putCallout(function (context) {
-                            if (offsets_of_dynamic_calls[offset_str]>=maximum_times_to_log_call_target) { return; }
+                            if (offsets_of_dynamic_calls[offset_str]>=maximum_times_to_log_call_target)
+                            {
+                                //Budget spent. Returning early stopped the WORK but left the callout
+                                //compiled into the code cache, being executed on every pass through this
+                                //call site for the rest of the session. Throwing the block away removes it,
+                                //and the gate in the transform above already refuses to emit a new callout
+                                //once the count has reached the limit, which is what makes the invalidate
+                                //stick instead of being undone by the recompile.
+                                safe_stalker_invalidate(threadId,address_of_this_dynamic_call);
+                                return;
+                            }
                             offsets_of_dynamic_calls[offset_str]+=1;
                             dict_with_threadIds_and_whether_to_stalk_non_calls[thread_id_str]=marker_value;
                         });
@@ -212,6 +254,13 @@ var call_tracing_depth_adjustment=0;                 //see note on the depth con
 //Called from the call tracing filter, to decide whether an event concerns the examined module.
 function is_address_inside_stalked_module(in_addr)
 {
+    //Until the module is found both bounds are ptr(0), and every address would compare as "outside".
+    //That answer happens to be harmless for the filter, but it is a coincidence rather than a decision, so
+    //say it explicitly: with no module there is no "inside" to be in.
+    if (!modulename_to_stalk_has_been_loaded)
+    {
+        return false;
+    }
     return in_addr.compare(baseaddr_of_modulename_to_stalk)>=0 &&
            in_addr.compare(endaddr_of_modulename_to_stalk)<0;
 }
@@ -256,8 +305,14 @@ function process_call_ret_stalk_event(threadId,is_call,fromaddr,toaddr,depth_of_
         call_trace.push("(...)");                       //calls we filtered out or never saw
     }
 
-    var succinct_info_for_fromaddr=extract_succinct_str_for_address(fromaddr).replaceAll(",","_");
-    var succinct_info_for_toaddr=extract_succinct_str_for_address(toaddr).replaceAll(",","_");
+    //The COMMA replacement is not cosmetic and must stay: the trace is printed as
+    //console.log("TID "+tid+":"+call_trace), and string concatenating an array calls Array.toString(),
+    //which joins with commas. A comma inside one frame would therefore read as a frame boundary.
+    //Whitespace is collapsed to "_" as well, so that each endpoint is a single unbroken token and the
+    //only spaces in a line are the " -> " between the two ends. That makes a trace line splittable and
+    //greppable; it is a readability choice rather than a correctness one.
+    var succinct_info_for_fromaddr=extract_succinct_str_for_address(fromaddr).replaceAll(",","_").replace(/\s+/g,"_");
+    var succinct_info_for_toaddr=extract_succinct_str_for_address(toaddr).replaceAll(",","_").replace(/\s+/g,"_");
     var new_frame=succinct_info_for_fromaddr+" -> "+succinct_info_for_toaddr;
     call_trace.push(new_frame);
 
@@ -287,7 +342,23 @@ function stalker_follow_and_log_all_calls_builtin_method(threadId)
         {
             if (modulename_to_stalk_has_been_loaded==false)
             {
-                return;
+                //Without the module we cannot apply the "ignore call/rets outside our module" filter,
+                //because we do not know where our module is, so an unfiltered run would be the only
+                //honest option - and that is exactly the shape is_early_call_tracing_active() describes.
+                //In every other shape there is nothing sensible to do with the event yet.
+                if (!is_early_call_tracing_active())
+                {
+                    return;
+                }
+                //Said once, so that a trace full of bare module!offset lines is not mistaken for a bug.
+                if (!the_early_call_tracing_notice_has_been_printed)
+                {
+                    the_early_call_tracing_notice_has_been_printed=true;
+                    console.log("Call tracing has started BEFORE "+modulename_to_stalk+" was found. Until it"
+                        +" appears there is no ghidra address to report, so trace entries are described by"
+                        +" module and debug symbol only. Entries switch to ghidra addresses automatically"
+                        +" once the module is loaded.");
+                }
             }
 
             var event=Stalker.parse(events,{annotate:true});
@@ -393,6 +464,15 @@ function exclude_all_blacklisted_modules_from_stalker()
 //report a thread entrypoint.
 function should_this_thread_be_stalked_based_on_name(thread)
 {
+    //An unnamed thread tells us nothing, and this is the FALLBACK path: the entrypoint test has already
+    //declined to answer. Stalking it is the right default, because a thread's name is usually set a
+    //moment AFTER it is created, so refusing here would drop the application's own threads simply for
+    //having been observed early. is_name_blacklisted() already returns false for a missing name, so this
+    //is the same answer made explicit rather than a change of behaviour.
+    if (!thread || !thread.name)
+    {
+        return true;
+    }
     return !is_name_blacklisted(thread.name,blacklisted_thread_name_substrings);
 }
 
@@ -541,15 +621,291 @@ function stopStalker(threadId)
 //script is being unloaded.
 function stop_stalking_all_threads()
 {
+    //Each thread is unfollowed inside its own try, because this runs on the two paths where failing halfway
+    //is most expensive: the agent being unloaded, and the examined module being unloaded. Getting every
+    //thread OFF Stalker's code cache is what stops the target from segfaulting when the cache is freed, so
+    //one thread that cannot be unfollowed must not cost us the rest of them.
+    var number_of_threads_unfollowed=0;
     for (var thread_id_str in dict_with_threadIds_that_are_being_stalked)
     {
-        if (dict_with_threadIds_that_are_being_stalked[thread_id_str]===true)
+        if (dict_with_threadIds_that_are_being_stalked[thread_id_str]!==true)
+        {
+            continue;
+        }
+        try
         {
             stopStalker(parseInt(thread_id_str,10));
+            number_of_threads_unfollowed+=1;
         }
+        catch (err)
+        {
+            console.log("Could not unfollow thread "+thread_id_str+": "+err
+                +" . That thread may still be executing out of Stalker's code cache.");
+        }
+    }
+    return number_of_threads_unfollowed;
+}
+
+
+
+//Thread ids waiting to be followed once our module has been found. An id keyed set, not an array of
+//Thread objects, for the same two reasons as the watchpoint queue: removing by object identity never
+//matches, because frida hands each observer callback its own object, and an id keyed set needs no linear
+//scan to insert or remove. The Thread object is resolved at drain time.
+var threadids_queued_for_stalking={};
+var timer_for_warning_that_our_module_was_never_found=null;
+var seconds_before_warning_that_our_module_was_never_found=30;
+
+
+//Whether a thread should be QUEUED instead of followed right now.
+//
+//The problem being avoided: Stalker compiles a basic block once and reuses the instrumented copy for
+//ever, and both transforms in this agent refuse to instrument anything while
+//modulename_to_stalk_has_been_loaded is still false. Following a thread before our module has been found
+//therefore fills its code cache with permanently empty copies. Deferring the follow means the very first
+//block a thread compiles already sees the loaded flags, the string table, and the module exclusions.
+//
+//Scoped to the "only stalk our module" case on purpose, because that is the configuration where following
+//early is most wasteful: the exclusions cannot be installed until our module's bounds are known, so an
+//early follow instruments foreign modules that we were about to exclude anyway. Widening this to every
+//configuration is a one line change, but it alters behaviour for runs that work today, so it is left as a
+//deliberate decision rather than a side effect. The refollow logic still covers the cases this does not.
+//Called from the thread observer.
+function should_following_this_thread_wait_for_our_module()
+{
+    if (modulename_to_stalk_has_been_loaded)
+    {
+        return false;   //the module is known, so following now is correct
+    }
+
+    //The one configuration where following early actually GAINS something. Call tracing is event based:
+    //Stalker emits call/ret from its engine rather than from instrumentation we place, so nothing is
+    //compiled wrong and the events are real. The only reason they used to be thrown away is that the
+    //receiver needs our module's bounds to apply the "ignore call/rets outside our module" filter - and
+    //when that filter is off, it does not need them at all. So with the filter off and the user having
+    //asked for it, follow immediately and trace the loader, the constructors and the rest of startup.
+    if (is_early_call_tracing_active())
+    {
+        return false;
+    }
+
+    //Everything else waits. Each of the remaining cases either produces wrong or missing data when
+    //followed early, or produces nothing at all:
+    //  * the marking method and string reference resolution are TRANSFORM based, and both transforms
+    //    refuse to instrument while modulename_to_stalk_has_been_loaded is false. Stalker caches those
+    //    empty copies for ever, which loses our module's own .init_array constructors and, for the
+    //    marking method, mis-attributes a dynamic call marker to whatever block runs next;
+    //  * the builtin dynamic call method and ordinary call tracing are event based and therefore not
+    //    compiled wrong, but their onReceive discards everything until the module is known, so following
+    //    early pays for Stalker to copy and instrument every block of every module during startup and
+    //    throws away the entire result.
+    return is_generally_stalking_enabled;
+}
+
+
+//True when call tracing has been asked to run before our module exists, and is in the only shape where
+//that is meaningful. Called from the follow decision and from the call tracing receiver, so that the two
+//can never disagree about whether an early event should be processed.
+function is_early_call_tracing_active()
+{
+    return (call_tracing_through_stalker_is_enabled
+            && call_tracing_before_our_module_is_loaded
+            && !call_tracing_ignore_callrets_outside_our_module);
+}
+
+
+//Our module has been unloaded from the process. Everything derived from it is now meaningless: the base
+//and end addresses point at memory that is no longer mapped, so every "is this address inside our module"
+//test would misclassify whatever gets mapped there next, ghidra offsets computed from that base would be
+//nonsense, and any hardware watchpoint is watching an address that no longer exists.
+//
+//This used to be ignored entirely - the module observer's onRemoved only refreshed the module map - so the
+//agent carried on confidently producing wrong output. Report it loudly and tear the state down.
+//Called from the module observer's onRemoved when the unloaded module is ours.
+function handle_our_module_being_unloaded()
+{
+    console.log("==================================================================================");
+    console.log("DragonHook: the examined module "+modulename_to_stalk+" has been UNLOADED from the process.");
+    console.log("  Everything derived from it is now invalid, so instrumentation is being torn down:");
+    console.log("  stalking stops on every thread, and every hardware watchpoint we installed is removed.");
+    console.log("  Results already written to the ghidra database are unaffected.");
+    console.log("==================================================================================");
+
+    //stop stalking first, while the bounds are still correct, so the transforms and receivers are not
+    //running against zeroed addresses while we take them away
+    try
+    {
+        stop_stalking_all_threads();
+    }
+    catch (err)
+    {
+        console.log("  could not stop stalking cleanly: "+err);
+    }
+    //nothing queued should be started against a module that is gone
+    threadids_queued_for_stalking={};
+
+    if (setting_of_watchpoints_is_enabled)
+    {
+        //Where the mapping that just went away actually lived. Captured HERE, while the bounds are still the
+        //dead mapping's - they are zeroed at the end of this function - because the teardown below is deferred
+        //and by the time it runs those globals may describe a completely different mapping.
+        var base_of_the_mapping_that_went_away=baseaddr_of_modulename_to_stalk;
+        var end_of_the_mapping_that_went_away=endaddr_of_modulename_to_stalk;
+        var the_old_range_is_usable=false;
+        try
+        {
+            the_old_range_is_usable=(!base_of_the_mapping_that_went_away.isNull()
+                && base_of_the_mapping_that_went_away.compare(end_of_the_mapping_that_went_away)<0);
+        }
+        catch (err) { the_old_range_is_usable=false; }
+
+        //deferred: this callback runs on whichever thread called dlclose, which may hold the loader lock,
+        //and unsetting a watchpoint has to stop and resume the owning thread
+        setTimeout(function () {
+            //The bookkeeping is NOT cleared before this point, and that is deliberate on two counts. The
+            //removal is driven entirely by threads_and_watchpoint_ids - it gates on the thread id being a key
+            //and reads the watchpoint id out of the entry - so emptying the map first turned the removal into a
+            //silent no-op that left every debug register armed on addresses the module no longer occupied. And
+            //until the removal actually runs those watchpoints are still LIVE, while
+            //do_we_have_any_watchpoint_bookkeeping_for_thread() is what the exception handler uses to recognise
+            //their traps as ours - so emptying it early made the handler hand our own traps to the application,
+            //a SIGTRAP the target never armed on memory the loader may since have reused. A crash, not a leak.
+            //
+            //The module can also be mapped AGAIN before this callback runs: module observer notifications fire
+            //on the thread doing the dlclose/dlopen, while this timer waits for the JS event loop, so both
+            //observers can get there first. A plugin host reopening a library it just closed is the normal way
+            //that happens. Three cases:
+            //
+            // - mapped again at the SAME base: the watchpoints still armed are watching valid addresses once
+            //   more, and their addresses are identical to the ones a reload would install, so there is nothing
+            //   to tell apart and nothing worth doing. Leave them.
+            // - mapped again ELSEWHERE: only the entries watching the OLD range are stale, and the new
+            //   mapping's are live, so this must not be the wholesale remover. Left unfiltered it would either
+            //   disarm the new mapping, or - if we simply skipped - leak the old debug registers forever, which
+            //   the slot allocator counts as occupied and which would starve the new mapping of slots.
+            // - still gone: every entry of ours lies in the old range, so the filter removes all of them,
+            //   exactly as the wholesale remover would have.
+            if (modulename_to_stalk_has_been_loaded && the_old_range_is_usable
+                && baseaddr_of_modulename_to_stalk.equals(base_of_the_mapping_that_went_away))
+            {
+                console.log("DragonHook: " + modulename_to_stalk + " was mapped again at the same base before"
+                    + " the watchpoint teardown ran, so its watchpoints are being left in place.");
+                return;
+            }
+            try
+            {
+                if (the_old_range_is_usable)
+                {
+                    var number_of_watchpoints_removed=remove_installed_watchpoints_watching_addresses_in_range(
+                        base_of_the_mapping_that_went_away, end_of_the_mapping_that_went_away);
+                    console.log("  removed " + number_of_watchpoints_removed + " hardware watchpoint(s) that"
+                        + " belonged to the unloaded mapping");
+                }
+                else
+                {
+                    //no usable bounds to filter by, so fall back to the wholesale teardown: without a range
+                    //there is nothing this could be confusing with a live mapping anyway
+                    remove_all_installed_watchpoints_for_all_threads();
+                    threads_and_watchpoint_ids={};
+                    watchpoint_ids_and_how_many_times_each_is_visited={};
+                }
+            }
+            catch (err)
+            {
+                console.log("  could not remove all watchpoints: "+err);
+            }
+        }, 0);
+        threadids_queued_for_watchpoint_installation={};
+    }
+
+    //Now forget where the module was. Done AFTER the teardown above for the reason given there.
+    modulename_to_stalk_has_been_loaded=false;
+    is_module_to_hook_loaded=false;
+    baseaddr_of_modulename_to_stalk=ptr(0);
+    endaddr_of_modulename_to_stalk=ptr(0);
+    module_to_hook_baseaddr=ptr(0);
+    module_to_hook_endaddr=ptr(0);
+    module_to_hook_size=0;
+
+    //The feature tables are offsets RELATIVE to the module, so they stay valid if it is mapped again at a
+    //different address, and are deliberately not cleared.
+    our_module_has_been_unloaded_at_least_once=true;
+}
+
+var our_module_has_been_unloaded_at_least_once=false;
+
+
+//Remembers a thread to follow later, and arms a one shot warning. Called from the thread observer.
+function queue_thread_for_stalking_when_our_module_is_found(threadId)
+{
+    threadids_queued_for_stalking[threadId.toString()]=true;
+
+    //Without this, a wrong module name in the config produces total silence: nothing is ever followed,
+    //nothing is ever reported, and there is no hint that the agent is simply waiting for a module that
+    //will never appear. That is the single easiest mistake to make, so say so loudly.
+    if (timer_for_warning_that_our_module_was_never_found===null)
+    {
+        timer_for_warning_that_our_module_was_never_found=setTimeout(function () {
+            timer_for_warning_that_our_module_was_never_found=null;
+            var number_still_waiting=0;
+            for (var thread_id_str in threadids_queued_for_stalking) { number_still_waiting+=1; }
+            if (number_still_waiting===0) { return; }   //the module turned up, nothing to warn about
+            console.log("DragonHook: still waiting for the module \""+modulename_to_stalk+"\" after "
+                +seconds_before_warning_that_our_module_was_never_found+" seconds, so "+number_still_waiting
+                +" thread(s) are queued and NOTHING is being stalked yet. If that module name is wrong,"
+                +" nothing will ever be reported. The modules currently loaded are:");
+            try
+            {
+                var mods=Process.enumerateModules();
+                for (var i=0;i<mods.length;i++)
+                {
+                    console.log("    "+mods[i].name+"  at "+mods[i].base+"  ("+mods[i].path+")");
+                }
+            }
+            catch (err)
+            {
+                console.log("    could not enumerate modules: "+err);
+            }
+        }, seconds_before_warning_that_our_module_was_never_found*1000);
     }
 }
 
+
+//Follows every thread that was queued while our module was still unknown.
+//Called deferred from begin_stalking_as_soon_as_module_is_found(), AFTER the flags, the feature tables and
+//the module exclusions are all in place, which is the whole point of having waited.
+function start_stalking_all_queued_threads()
+{
+    var queued_thread_ids=threadids_queued_for_stalking;
+    threadids_queued_for_stalking={};   //drain first, so a second call cannot follow everything twice
+
+    var number_of_threads_followed=0;
+    for (var thread_id_str in queued_thread_ids)
+    {
+        //resolved now rather than stored earlier, so the object is fresh and an exited thread is simply
+        //absent from the dictionary
+        var thread_object=dict_from_threadids_to_threads[thread_id_str];
+        if (!thread_object)
+        {
+            console.log("Not stalking thread "+thread_id_str+", it exited while queued");
+            continue;
+        }
+        //it may also have been renamed into the blacklist since it was queued
+        if (!should_this_thread_be_stalked(thread_object))
+        {
+            console.log("Not stalking "+describe_thread_by_id(thread_id_str)+", it no longer passes the thread filter");
+            continue;
+        }
+        dict_with_threadIds_call_traces[thread_id_str]=[];
+        startStalker(parseInt(thread_id_str,10), modulename_to_stalk);
+        number_of_threads_followed+=1;
+    }
+    if (number_of_threads_followed>0)
+    {
+        console.log("Stalker: began stalking "+number_of_threads_followed+" thread(s) that were waiting for "
+            +modulename_to_stalk+" to be found, so their very first compiled block is already instrumented");
+    }
+}
 
 
 //call with startStalker(this.threadId,modulename_to_stalk)
@@ -564,7 +920,12 @@ function startStalker(threadId, targetModule){
     {
         return;
     }
-    dict_with_threadIds_that_are_being_stalked[thread_id_to_str]=true;
+
+    //The flag is set only AFTER a follow has really happened. Setting it up front meant that when every
+    //enabled feature declined to follow - which stalker_follow_and_resolve_string_references() now does
+    //once all the selected strings have been resolved - the thread was recorded as followed while Stalker
+    //knew nothing about it. A later unfollow then threw, and the refollow logic trusted the same lie.
+    var a_follow_actually_happened=false;
 
     if (dynamic_call_stalking_is_enabled)
     {
@@ -575,17 +936,25 @@ function startStalker(threadId, targetModule){
         else
         {
             stalker_follow_dynamic_calls_marking_threads_method(threadId);
-        }      
+        }
+        a_follow_actually_happened=true;
     }
     if (call_tracing_through_stalker_is_enabled)
     {
         stalker_follow_and_log_all_calls_builtin_method(threadId);
+        a_follow_actually_happened=true;
     }
-    if (string_reference_resolution_is_enabled)
+    if (string_reference_resolution_is_enabled
+        && !string_reference_resolution_has_been_stopped_because_it_is_complete)
     {
         stalker_follow_and_resolve_string_references(threadId);
+        a_follow_actually_happened=true;
     }
 
+    if (a_follow_actually_happened)
+    {
+        dict_with_threadIds_that_are_being_stalked[thread_id_to_str]=true;
+    }
 }
 
 
@@ -612,6 +981,13 @@ function begin_stalking_as_soon_as_module_is_found()
     {
         exclude_all_modules_except_our_module_from_stalker(); // no-op unless the relevant guard flag is on
     }
+
+    //Now that the flags, the feature tables and the module exclusions are all in place, follow the threads
+    //that were deliberately made to wait for exactly this moment. Deferred to frida's own JS thread,
+    //because Stalker.follow() on another thread has to interrupt and rewrite that thread's context, and
+    //this function runs on whichever thread loaded the module - possibly holding the loader lock.
+    setTimeout(start_stalking_all_queued_threads,0);
+
 }
 
 

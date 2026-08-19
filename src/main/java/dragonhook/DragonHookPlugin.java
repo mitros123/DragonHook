@@ -16,6 +16,8 @@
 package dragonhook;
 
 import dragonhook.util.CreatorOfNecessaryFiles;
+import dragonhook.util.DOSLimitsTracker;
+import dragonhook.util.JSAgentPreparer;
 import ghidra.MiscellaneousPluginPackage;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.plugin.ProgramPlugin;
@@ -45,12 +47,13 @@ public class DragonHookPlugin extends ProgramPlugin {
     public DragonEditFridaAgentAction editFridaScriptAction;
     public DragonEditPythonInvokerAction editPythonInvokerAction;
     public DragonHookRunAgentAction runAgentAction;
+    public DragonForceStopAgentAction forceStopAgentAction;
     public DragonResetFridaAgentAction resetFridaScriptAction;
     public DragonResetAllConfigsAction resetAllConfigsAction;
     public DragonResetDOSLimitsAction resetDOSlimitsAction;
     public DragonStartHTTPServerAction startHTTPServerAction;
     public DragonStopHTTPServerAction stopHTTPServerAction;
-    public static String  DragonHook_plugin_version="0.1.6";
+    public static String  DragonHook_plugin_version="0.2.0";
 
 
     /**
@@ -71,6 +74,10 @@ public class DragonHookPlugin extends ProgramPlugin {
         
         runAgentAction = new DragonHookRunAgentAction(this);
         tool.addAction(runAgentAction);
+
+        //sits right next to "Run Agent", and is only enabled while an agent is actually running
+        forceStopAgentAction = new DragonForceStopAgentAction(this);
+        tool.addAction(forceStopAgentAction);
         
         
         tool.setMenuGroup(new String[] { "DragonHook Config..." }, "Dragon-Hook");
@@ -105,6 +112,53 @@ public class DragonHookPlugin extends ProgramPlugin {
     public Program getCurrentProgram() {
         ProgramManager pm = tool.getService(ProgramManager.class);
         return pm != null ? pm.getCurrentProgram() : null;
+    }
+
+    //ProgramPlugin calls these whenever the user switches program in Ghidra. Without them,
+    //currentprogram was whatever was open when the plugin was constructed, FOREVER: open program A, use
+    //DragonHook, open program B, use DragonHook, and every image base, function range, offset, comment and
+    //xref was still computed against A - so results were silently written into the wrong program's
+    //database. The actions each keep their own copy, so they are told as well.
+    @Override
+    protected void programActivated(Program program) {
+        super.programActivated(program);
+        this.currentprogram=program;
+        push_current_program_to_all_actions(program);
+    }
+
+    @Override
+    protected void programDeactivated(Program program) {
+        super.programDeactivated(program);
+        if (this.currentprogram==program)
+        {
+            this.currentprogram=null;
+            push_current_program_to_all_actions(null);
+        }
+    }
+
+    //The agent file is prepared once per program (module name and ghidra image base are baked into it),
+    //so switching program has to force that preparation to happen again for the new one.
+    private void push_current_program_to_all_actions(Program program)
+    {
+        JSAgentPreparer.agent_has_been_updated_with_current_program=false;
+
+        //The per-codeunit DOS counters are keyed by Address, and Address.equals() compares the address SPACE
+        //and the offset - not the owning program. Two programs that both contain ram:00401000 therefore
+        //produce EQUAL keys, so counters accumulated against program A would silently apply to program B and
+        //the agent would be refused updates for addresses it had never touched. Reset them on every switch.
+        DOSLimitsTracker.reset_DOS_limits();
+
+        if (selectionAction!=null) { selectionAction.set_current_program(program); }
+        if (runAgentAction!=null) { runAgentAction.set_current_program(program); }
+        if (forceStopAgentAction!=null) { forceStopAgentAction.set_current_program(program); }
+        if (editConfigAction!=null) { editConfigAction.set_current_program(program); }
+        if (editFridaScriptAction!=null) { editFridaScriptAction.set_current_program(program); }
+        if (editPythonInvokerAction!=null) { editPythonInvokerAction.set_current_program(program); }
+        if (resetFridaScriptAction!=null) { resetFridaScriptAction.set_current_program(program); }
+        if (resetAllConfigsAction!=null) { resetAllConfigsAction.set_current_program(program); }
+        if (resetDOSlimitsAction!=null) { resetDOSlimitsAction.set_current_program(program); }
+        if (startHTTPServerAction!=null) { startHTTPServerAction.set_current_program(program); }
+        if (stopHTTPServerAction!=null) { stopHTTPServerAction.set_current_program(program); }
     }
 
     @Override

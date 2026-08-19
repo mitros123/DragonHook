@@ -73,6 +73,9 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
     public JCheckBox CallTraceOutsideOurModuleCheckBox;
     public Boolean isCallTraceOutsideOurModuleCheckBoxchecked=false;
 
+    public JCheckBox CallTracing_TraceBeforeOurModuleIsLoadedCheckBox;
+    public Boolean isCallTracing_TraceBeforeOurModuleIsLoadedCheckBoxchecked=false;
+
     public JCheckBox CallTracing_StalkOtherModulesCheckBox;
     public Boolean isCallTracing_StalkOtherModulesCheckBoxchecked=false;
     
@@ -86,6 +89,12 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
 
     public JCheckBox StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox;
     public Boolean isStringRefs_AlsoInstrumentRegisterBasedAccessesCheckBoxchecked=false;
+
+    public JCheckBox StringRefs_AlsoInstrumentCallArgumentsCheckBox;
+    public Boolean isStringRefs_AlsoInstrumentCallArgumentsCheckBoxchecked=false;
+
+    public JCheckBox StringRefs_AlsoInstrumentRegisterArithmeticCheckBox;
+    public Boolean isStringRefs_AlsoInstrumentRegisterArithmeticCheckBoxchecked=false;
 
     public JCheckBox StringRefs_OnlyStalkThreadsWithNameCheckBox;
     public Boolean isStringRefs_OnlyStalkThreadsWithNameCheckBoxchecked=false;
@@ -110,6 +119,12 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
     
     public JLabel WatchpointTriggerOnOperationLabel;
     public JComboBox<String> WatchpointTriggerOnOperationComboBox;
+
+    //The agent has always had the two variables for a watchpoint thread name restriction, carrying the
+    //"UPDATED FROM DRAGONHOOK PLUGIN" marker, but nothing ever set them and no option existed here.
+    public JCheckBox Watchpoints_OnlyUseThreadsWithNameCheckBox;
+    public Boolean isWatchpoints_OnlyUseThreadsWithNameCheckBoxchecked=false;
+    public JTextField Watchpoints_OnlyUseThreadsWithNameTextField;
     
     
     //Backtrace options
@@ -204,12 +219,15 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         CallTracing_OnlyStalkThreadsWithNameCheckBox.setEnabled(false);
         CallTracing_OnlyStalkThreadsWithNameTextField.setEnabled(false);
         CallTraceOutsideOurModuleCheckBox.setEnabled(false);
+        CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.setEnabled(false);
         
         DynCalls_StalkOtherModulesCheckBox.setEnabled(false);
         CallTracing_StalkOtherModulesCheckBox.setEnabled(false);
         StringRefs_StalkOtherModulesCheckBox.setEnabled(false);
         StringRefs_AlsoIncludeStringsWithReferencesCheckBox.setEnabled(false);
         StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.setEnabled(false);
+        StringRefs_AlsoInstrumentCallArgumentsCheckBox.setEnabled(false);
+        StringRefs_AlsoInstrumentRegisterArithmeticCheckBox.setEnabled(false);
         StringRefs_OnlyStalkThreadsWithNameCheckBox.setEnabled(false);
         StringRefs_OnlyStalkThreadsWithNameTextField.setEnabled(false);
         MaxTimesToLogEachStringReferenceLabel.setEnabled(false);
@@ -221,6 +239,8 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         MaxTimesLogWatchpointsComboBox.setEnabled(false);
         WatchpointTriggerOnOperationLabel.setEnabled(false);
         WatchpointTriggerOnOperationComboBox.setEnabled(false);
+        Watchpoints_OnlyUseThreadsWithNameCheckBox.setEnabled(false);
+        Watchpoints_OnlyUseThreadsWithNameTextField.setEnabled(false);
         
         BacktrackerTypeLabel.setEnabled(false);
         BacktrackerTypeComboBox.setEnabled(false);
@@ -243,7 +263,12 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
 
         StalkSelectedDynamicCallsCheckBox = new GCheckBox("Stalk and resolve the targets of the selected dynamic calls");
         StalkSelectedDynamicCallsCheckBox.setToolTipText(
-            "Take the selected addresses, extract the ones containing dynamic calls and generate Frida code which stalks them, resolving their target during runtime and updating the GhidraDB.");
+            "<html>Take the selected addresses, extract the ones containing dynamic calls and generate Frida code which stalks them,<br>"
+            + "resolving their target during runtime and updating the GhidraDB.<br>"
+            + "<br>"
+            + "<b>When stalking:</b> no thread is followed until the examined module is found in the process, so anything that runs<br>"
+            + "before that - the loader and library initialisers - is not observed. From that point every thread is followed and its<br>"
+            + "code is executed from Stalker's instrumented copy, which is a substantial slowdown for as long as the agent runs.<html>");
         
         
 
@@ -279,7 +304,12 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         DynCalls_StalkOtherModulesCheckBox.setToolTipText(
             "<html>On by default, and needed here: a dynamic call whose target is in another module can only be resolved if that module is stalked too.<br>"
             + "If you uncheck this, every other module is EXCLUDED from Stalker. That is much faster, but a call into an excluded module runs natively,<br>"
-            + "so the next block Stalker sees is the return continuation and the target is recorded as a possible Stalker issue instead of the real callee.<html>");
+            + "so the next block Stalker sees is the return continuation and the target is recorded as a possible Stalker issue instead of the real callee."
+            + "<br>"
+            + "<b>When it is OFF:</b> other modules run natively and are not instrumented, which is much faster - but a call made FROM<br>"
+            + "another module INTO your module (a callback, a vtable dispatch, a qsort comparator, a GUI event handler) is not observed<br>"
+            + "either, because Stalker is not executing inside the code that makes that call. Turn this on if your code is reached<br>"
+            + "mainly through callbacks from a framework or library.<html>");
         
         
         
@@ -288,7 +318,12 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         
         StalkForCallTracingCheckBox = new GCheckBox("Stalk all calls, creating a call trace");
         StalkForCallTracingCheckBox.setToolTipText(
-            "<html>Use the Stalker builtin method to trace all calls and rets, so that a call trace is displayed in the standard output file.<br>This option is not related to the current selection, all the called functions inside the current module will be logged.<html>");
+            "<html>Use the Stalker builtin method to trace all calls and rets, so that a call trace is displayed in the standard output file.<br>"
+            + "This option is not related to the current selection, all the called functions inside the current module will be logged.<br>"
+            + "<br>"
+            + "<b>When stalking:</b> by default no thread is followed until the examined module is found, so process startup is not traced -<br>"
+            + "the option further down lifts that. Once following, every thread runs from Stalker's instrumented copy of the code, which<br>"
+            + "is a substantial slowdown, and the trace can grow very large very quickly.<html>");
         
         CallTracing_OnlyStalkThreadsWithNameCheckBox= new GCheckBox("Only Stalk threads whose lowercase name contains: ");
         CallTracing_OnlyStalkThreadsWithNameCheckBox.setToolTipText(
@@ -307,11 +342,33 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
             + "It depends on the option above: a module that is not instrumented emits no events at all, so with \"Instrument other modules too\"<br>"
             + "switched off there is nothing for this filter to let through. That is why it is disabled in that case.<html>");
 
+        CallTracing_TraceBeforeOurModuleIsLoadedCheckBox = new GCheckBox("Start tracing immediately, without waiting for the examined module to be loaded");
+        CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.setToolTipText(
+            "<html><b>OFF by default.</b> Requires the option above, because it is that filter which needs to know where your module is.<br>"
+            + "<br>"
+            + "Normally every Stalker feature waits for the examined module to appear before following any thread, since until then<br>"
+            + "there is nothing meaningful to record. Call tracing is the exception: its call and ret events come from the Stalker<br>"
+            + "engine rather than from instrumentation, so they are perfectly good even before your module exists.<br>"
+            + "<br>"
+            + "Turn this on to trace the <b>startup</b> of the process: the dynamic loader, library initialisers, and your own module's<br>"
+            + "constructors, all of which finish running before the module observer reports the module.<br>"
+            + "<br>"
+            + "While the module is still absent there is no ghidra address to print, so entries are described by module name and<br>"
+            + "debug symbol. They switch to ghidra addresses automatically the moment the module is loaded.<br>"
+            + "<br>"
+            + "<b>Cost:</b> High. Every thread is followed from the very first instruction, so the whole of process startup runs<br>"
+            + "instrumented.<html>");
+
         CallTracing_StalkOtherModulesCheckBox = new GCheckBox("Instrument other modules too (needed to see anything happening inside them)");
         CallTracing_StalkOtherModulesCheckBox.setSelected(true);
         CallTracing_StalkOtherModulesCheckBox.setToolTipText(
             "<html>On by default. If you uncheck this, every other module is EXCLUDED from Stalker, which is much faster but means no call or ret inside another module<br>"
-            + "produces an event at all. The option above (trace calls outside our module) then has nothing to report, so leave this on if you want an external trace.<html>");
+            + "produces an event at all. The option above (trace calls outside our module) then has nothing to report, so leave this on if you want an external trace."
+            + "<br>"
+            + "<b>When it is OFF:</b> other modules run natively and are not instrumented, which is much faster - but a call made FROM<br>"
+            + "another module INTO your module (a callback, a vtable dispatch, a qsort comparator, a GUI event handler) is not observed<br>"
+            + "either, because Stalker is not executing inside the code that makes that call. Turn this on if your code is reached<br>"
+            + "mainly through callbacks from a framework or library.<html>");
 
 
         ResolveStringsWithoutReferencesCheckBox = new GCheckBox("Stalk and resolve the references of the SELECTED STRINGS  (x64, x86 and ARM64)");
@@ -328,10 +385,22 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
             + "&nbsp;&nbsp;register. Those need the register based option below; only non PIC absolute immediates resolve without it.<br>"
             + "On any other architecture only absolute immediates will be found.<html>");
 
-        StringRefs_StalkOtherModulesCheckBox = new GCheckBox("Instrument other modules too (only useful if the code forming the address lives elsewhere)");
+        StringRefs_StalkOtherModulesCheckBox = new GCheckBox("Instrument other modules too (only useful if code forming/accessing the address lives elsewhere)");
         StringRefs_StalkOtherModulesCheckBox.setToolTipText(
-            "<html>OFF by default, unlike the other Stalker features: only instructions inside the examined module are ever examined for string references,<br>"
-            + "so stalking the rest of the process is pure cost. Turn it on only if the code that forms the address lives in another module (a helper in a shared library, for instance).<html>");
+            "<html><b>OFF by default.</b><br>"
+            + "Extends Stalker instrumentation to all other loaded modules in the process (e.g. shared libraries, helper DLLs/.so files).<br>"
+            + "<br>"
+            + "When an instruction inside an <b>external module</b> touches or references one of the selected strings in your module,<br>"
+            + "DragonHook logs a detailed comment on the string in Ghidra DB indicating the referencing external module name,<br>"
+            + "the offset from the start of that external module, and debug symbol information (without creating invalid out-of-module xrefs).<br>"
+            + "<br>"
+            + "<b>Cost:</b> High. Stalking all external libraries throughout the process creates significant overhead and should only be enabled<br>"
+            + "when you expect third-party or helper libraries to directly access your module's strings."
+            + "<br>"
+            + "<b>When it is OFF:</b> other modules run natively and are not instrumented, which is much faster - but a call made FROM<br>"
+            + "another module INTO your module (a callback, a vtable dispatch, a qsort comparator, a GUI event handler) is not observed<br>"
+            + "either, because Stalker is not executing inside the code that makes that call. Turn this on if your code is reached<br>"
+            + "mainly through callbacks from a framework or library.<html>");
 
         StringRefs_AlsoIncludeStringsWithReferencesCheckBox = new GCheckBox("Also include selected strings that already have static references");
         StringRefs_AlsoIncludeStringsWithReferencesCheckBox.setToolTipText(
@@ -350,6 +419,29 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
             + "<br>"
             + "<b>Required on x86 32 bit</b>, where position independent code forms string addresses from a GOT base register rather than PC relative.<br>"
             + "On x64 and ARM64 you can leave it off and still catch the usual rip relative / adrp+add forms.<html>");
+
+        StringRefs_AlsoInstrumentCallArgumentsCheckBox = new GCheckBox("Also resolve string references passed as function call arguments (ABI argument registers)");
+        StringRefs_AlsoInstrumentCallArgumentsCheckBox.setToolTipText(
+            "<html><b>OFF by default.</b><br>"
+            + "When a function in your module calls an external library function (such as <code>puts</code>, <code>printf</code>, <code>strcmp</code>, <code>strlen</code>, <code>syslog</code>, <code>fopen</code>),<br>"
+            + "the string pointer is passed in standard calling convention registers (e.g., <code>rdi</code>/<code>rsi</code>/<code>rdx</code>/<code>rcx</code>/<code>r8</code>/<code>r9</code> on x64 System V,<br>"
+            + "<code>rcx</code>/<code>rdx</code>/<code>r8</code>/<code>r9</code> on Windows x64, <code>x0</code>–<code>x7</code> on ARM64, <code>r0</code>–<code>r3</code> on ARM32, stack <code>push</code> on x86).<br>"
+            + "<br>"
+            + "Because external modules are not stalked by default, memory dereferences inside <code>libc</code> are not observed by Stalker.<br>"
+            + "Enabling this option places a callout at every <code>call</code>/<code>bl</code>/<code>blr</code>/<code>push</code> instruction inside your module to inspect live argument registers against the selected strings,<br>"
+            + "recording xrefs directly on the call site.<br>"
+            + "<br>"
+            + "<b>Cost:</b> Incurs callout overhead on function call instructions until the log limit is reached.<html>");
+
+        StringRefs_AlsoInstrumentRegisterArithmeticCheckBox = new GCheckBox("Also resolve string references formed by dynamic register arithmetic (add/sub/lea)");
+        StringRefs_AlsoInstrumentRegisterArithmeticCheckBox.setToolTipText(
+            "<html><b>OFF by default.</b><br>"
+            + "Instruments arithmetic instructions (<code>add</code>, <code>sub</code>, <code>adds</code>, <code>subs</code>, register <code>lea</code>) that calculate memory addresses directly between registers<br>"
+            + "without explicit memory operands (e.g. <code>add rax, rbx</code> or <code>add x0, x1, x2</code>).<br>"
+            + "<br>"
+            + "Enabling this option emits a callout to evaluate the runtime result of the arithmetic operation against the selected strings in your module.<br>"
+            + "<br>"
+            + "<b>Cost:</b> Places callouts on register arithmetic instructions, adding runtime overhead on hot computational loops until resolved.<html>");
 
         StringRefs_OnlyStalkThreadsWithNameCheckBox= new GCheckBox("Only Stalk threads whose lowercase name contains: ");
         StringRefs_OnlyStalkThreadsWithNameCheckBox.setToolTipText(
@@ -413,6 +505,9 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
             //the trace filter can only let something through if the other modules are instrumented at all
             CallTraceOutsideOurModuleCheckBox.setEnabled(is_stalking_for_call_traces_selected
                     && CallTracing_StalkOtherModulesCheckBox.isSelected());
+            //early tracing has no filter to fall back on, so it needs the unfiltered mode above
+            CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.setEnabled(is_stalking_for_call_traces_selected
+                    && CallTraceOutsideOurModuleCheckBox.isEnabled() && CallTraceOutsideOurModuleCheckBox.isSelected());
             
             StalkSelectedDynamicCallsCheckBox.setEnabled(!is_stalking_for_call_traces_selected); //disable the other Stalker options
             ResolveStringsWithoutReferencesCheckBox.setEnabled(!is_stalking_for_call_traces_selected);
@@ -427,35 +522,78 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
             if (!other_modules_are_instrumented)
             {
                 CallTraceOutsideOurModuleCheckBox.setSelected(false);
+                CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.setSelected(false);
             }
             CallTraceOutsideOurModuleCheckBox.setEnabled(other_modules_are_instrumented);
+            CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.setEnabled(other_modules_are_instrumented
+                    && CallTraceOutsideOurModuleCheckBox.isSelected());
          });
+
+        //Tracing before the module exists is only possible while the trace is UNFILTERED, because the
+        //filter is the only thing in the receiver that needs the module's bounds. Clearing it here keeps
+        //the two options from contradicting each other.
+        CallTraceOutsideOurModuleCheckBox.addActionListener( e -> {
+            boolean the_trace_is_unfiltered=(CallTraceOutsideOurModuleCheckBox.isEnabled()
+                    && CallTraceOutsideOurModuleCheckBox.isSelected());
+            if (!the_trace_is_unfiltered)
+            {
+                CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.setSelected(false);
+            }
+            CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.setEnabled(the_trace_is_unfiltered);
+         });
+
+        DynCalls_OnlyStalkThreadsWithNameCheckBox.addActionListener( e -> {
+            DynCalls_OnlyStalkThreadsWithNameTextField.setEnabled(
+                DynCalls_OnlyStalkThreadsWithNameCheckBox.isEnabled() && DynCalls_OnlyStalkThreadsWithNameCheckBox.isSelected());
+        });
+
+        CallTracing_OnlyStalkThreadsWithNameCheckBox.addActionListener( e -> {
+            CallTracing_OnlyStalkThreadsWithNameTextField.setEnabled(
+                CallTracing_OnlyStalkThreadsWithNameCheckBox.isEnabled() && CallTracing_OnlyStalkThreadsWithNameCheckBox.isSelected());
+        });
+
+        StringRefs_OnlyStalkThreadsWithNameCheckBox.addActionListener( e -> {
+            StringRefs_OnlyStalkThreadsWithNameTextField.setEnabled(
+                StringRefs_OnlyStalkThreadsWithNameCheckBox.isEnabled() && StringRefs_OnlyStalkThreadsWithNameCheckBox.isSelected());
+        });
 
         ResolveStringsWithoutReferencesCheckBox.addActionListener( e -> {
             boolean is_resolving_string_refs_selected=ResolveStringsWithoutReferencesCheckBox.isSelected();
             StringRefs_StalkOtherModulesCheckBox.setEnabled(is_resolving_string_refs_selected);
             StringRefs_AlsoIncludeStringsWithReferencesCheckBox.setEnabled(is_resolving_string_refs_selected);
             StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.setEnabled(is_resolving_string_refs_selected);
+            StringRefs_AlsoInstrumentCallArgumentsCheckBox.setEnabled(is_resolving_string_refs_selected);
+            StringRefs_AlsoInstrumentRegisterArithmeticCheckBox.setEnabled(is_resolving_string_refs_selected);
             StringRefs_OnlyStalkThreadsWithNameCheckBox.setEnabled(is_resolving_string_refs_selected);
-            StringRefs_OnlyStalkThreadsWithNameTextField.setEnabled(is_resolving_string_refs_selected);
+            StringRefs_OnlyStalkThreadsWithNameTextField.setEnabled(is_resolving_string_refs_selected
+                    && StringRefs_OnlyStalkThreadsWithNameCheckBox.isSelected());
             MaxTimesToLogEachStringReferenceLabel.setEnabled(is_resolving_string_refs_selected);
             MaxTimesToLogEachStringReferenceComboBox.setEnabled(is_resolving_string_refs_selected);
-            boolean the_register_tier_is_on=(is_resolving_string_refs_selected
-                    && StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.isSelected());
-            StringRefs_SecondsBeforeDroppingRegisterTierLabel.setEnabled(the_register_tier_is_on);
-            StringRefs_SecondsBeforeDroppingRegisterTierComboBox.setEnabled(the_register_tier_is_on);
+            
+            boolean any_runtime_tier_on=(is_resolving_string_refs_selected
+                    && (StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.isSelected()
+                        || StringRefs_AlsoInstrumentCallArgumentsCheckBox.isSelected()
+                        || StringRefs_AlsoInstrumentRegisterArithmeticCheckBox.isSelected()));
+            StringRefs_SecondsBeforeDroppingRegisterTierLabel.setEnabled(any_runtime_tier_on);
+            StringRefs_SecondsBeforeDroppingRegisterTierComboBox.setEnabled(any_runtime_tier_on);
 
             StalkSelectedDynamicCallsCheckBox.setEnabled(!is_resolving_string_refs_selected); //disable the other Stalker options
             StalkForCallTracingCheckBox.setEnabled(!is_resolving_string_refs_selected);
          });
 
-        //the time limit only means anything while the register based tier is actually on
-        StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.addActionListener( e -> {
-            boolean the_register_tier_is_on=(StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.isEnabled()
-                    && StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.isSelected());
-            StringRefs_SecondsBeforeDroppingRegisterTierLabel.setEnabled(the_register_tier_is_on);
-            StringRefs_SecondsBeforeDroppingRegisterTierComboBox.setEnabled(the_register_tier_is_on);
-         });
+        //The time limit applies whenever any runtime callout tier is active
+        java.awt.event.ActionListener updateRegisterTierTimerState = e -> {
+            boolean any_runtime_tier_on=(ResolveStringsWithoutReferencesCheckBox.isEnabled()
+                    && ResolveStringsWithoutReferencesCheckBox.isSelected()
+                    && (StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.isSelected()
+                        || StringRefs_AlsoInstrumentCallArgumentsCheckBox.isSelected()
+                        || StringRefs_AlsoInstrumentRegisterArithmeticCheckBox.isSelected()));
+            StringRefs_SecondsBeforeDroppingRegisterTierLabel.setEnabled(any_runtime_tier_on);
+            StringRefs_SecondsBeforeDroppingRegisterTierComboBox.setEnabled(any_runtime_tier_on);
+        };
+        StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox.addActionListener(updateRegisterTierTimerState);
+        StringRefs_AlsoInstrumentCallArgumentsCheckBox.addActionListener(updateRegisterTierTimerState);
+        StringRefs_AlsoInstrumentRegisterArithmeticCheckBox.addActionListener(updateRegisterTierTimerState);
         
         
         
@@ -479,7 +617,18 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         String[] watchpoint_operation= {"read","write","read/write (unreliable, not recommended)"};
         WatchpointTriggerOnOperationComboBox=new JComboBox<>(watchpoint_operation);
         WatchpointTriggerOnOperationComboBox.setSelectedIndex(0);
-        
+
+        Watchpoints_OnlyUseThreadsWithNameCheckBox= new GCheckBox("Only set watchpoints on threads whose lowercase name contains: ");
+        Watchpoints_OnlyUseThreadsWithNameCheckBox.setToolTipText(
+                "<html>A hardware watchpoint lives in the debug registers of ONE thread, so it has to be installed on every thread<br>"
+                + "separately and only fires on the thread it was installed on. On a process with many threads that means many<br>"
+                + "cross thread installs, each of which needs the OS to let us write another thread's debug registers (a ptrace<br>"
+                + "attach on linux and android), and each of which can be refused.<br>"
+                + "<br>"
+                + "Restricting the installation to the threads you actually care about avoids all of those attempts. For example<br>"
+                + "on an Android Unity application only \"UnityMain\" usually matters. Check stdout for the thread names.<html>");
+        Watchpoints_OnlyUseThreadsWithNameTextField= new JTextField(20);
+
         //add the action listener too
         SetHardwareWatchPointCheckBox.addActionListener( e -> {
             boolean is_setting_watchpoints_selected=SetHardwareWatchPointCheckBox.isSelected();
@@ -487,6 +636,16 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
             MaxTimesLogWatchpointsComboBox.setEnabled(is_setting_watchpoints_selected);
             WatchpointTriggerOnOperationLabel.setEnabled(is_setting_watchpoints_selected);
             WatchpointTriggerOnOperationComboBox.setEnabled(is_setting_watchpoints_selected);
+            Watchpoints_OnlyUseThreadsWithNameCheckBox.setEnabled(is_setting_watchpoints_selected);
+            //the text field only means anything while its own checkbox is ticked, same rule as the three
+            //stalker features use for their thread name fields
+            Watchpoints_OnlyUseThreadsWithNameTextField.setEnabled(is_setting_watchpoints_selected
+                    && Watchpoints_OnlyUseThreadsWithNameCheckBox.isSelected());
+         });
+
+        Watchpoints_OnlyUseThreadsWithNameCheckBox.addActionListener( e -> {
+            Watchpoints_OnlyUseThreadsWithNameTextField.setEnabled(
+                Watchpoints_OnlyUseThreadsWithNameCheckBox.isEnabled() && Watchpoints_OnlyUseThreadsWithNameCheckBox.isSelected());
          });
         
         
@@ -510,7 +669,20 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         
 
         BacktraceFunctionsByRegexLabel= new JLabel("Case Insensitive regex to match function names for which Custom Backtracer will be used: ");
+        BacktraceFunctionsByRegexLabel.setToolTipText(
+            "<html>The <b>WHOLE</b> function name has to match, not just part of it, so wrap a substring in <code>.*</code>:<br>"
+            + "&nbsp;&nbsp;<code>.*init.*</code> &nbsp; matches FUN_init_array, my_initialiser, sqlite3_initialize<br>"
+            + "&nbsp;&nbsp;<code>init</code> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; matches <b>only</b> a function called exactly \"init\"<br>"
+            + "<br>"
+            + "More examples:<br>"
+            + "&nbsp;&nbsp;<code>FUN_.*</code> &nbsp;&nbsp;&nbsp;&nbsp; every unnamed function ghidra auto named<br>"
+            + "&nbsp;&nbsp;<code>.*(encrypt|decrypt).*</code> &nbsp; either word anywhere in the name<br>"
+            + "&nbsp;&nbsp;<code>Java_.*_nativeInit</code> &nbsp; a JNI entry point<br>"
+            + "<br>"
+            + "Matching is case insensitive. An invalid expression is reported in the console and the run is"
+            + " abandoned rather than generating no hooks silently.<html>");
         BacktraceFunctionsByRegexTextField = new JTextField(10);
+        BacktraceFunctionsByRegexTextField.setToolTipText(BacktraceFunctionsByRegexLabel.getToolTipText());
 
 
         PrecomputeComputedCallReturnAddressesCheckBox=new GCheckBox("Precompute the return addresses of all computed calls (launches a scan of the whole program)");
@@ -576,6 +748,7 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         JPanel callTracingOptionssubPanel1 = new JPanel(new HorizontalLayout(4));
         JPanel callTracingOptionssubPanel2 = new JPanel(new HorizontalLayout(4));
         JPanel callTracingOptionssubPanel3 = new JPanel(new HorizontalLayout(4));
+        JPanel callTracingOptionssubPanel4 = new JPanel(new HorizontalLayout(4));
 
         JPanel stringRefsOptionsPanel = new JPanel(new VerticalLayout(4));
         JPanel stringRefsOptionssubPanel1 = new JPanel(new HorizontalLayout(4));
@@ -584,9 +757,12 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         JPanel stringRefsOptionssubPanel4 = new JPanel(new HorizontalLayout(4));
         JPanel stringRefsOptionssubPanel5 = new JPanel(new HorizontalLayout(4));
         JPanel stringRefsOptionssubPanel6 = new JPanel(new HorizontalLayout(4));
+        JPanel stringRefsOptionssubPanel7 = new JPanel(new HorizontalLayout(4));
+        JPanel stringRefsOptionssubPanel8 = new JPanel(new HorizontalLayout(4));
         JPanel hardwareWatchpointPanel = new JPanel(new VerticalLayout(4));
         JPanel hardwareWatchpointsubPanel1 = new JPanel(new HorizontalLayout(4));
         JPanel hardwareWatchpointsubPanel2 = new JPanel(new HorizontalLayout(4));
+        JPanel hardwareWatchpointsubPanel3 = new JPanel(new HorizontalLayout(4));
         JPanel customBacktracerPanel = new JPanel(new VerticalLayout(4));
         JPanel customBacktracersubPanel1 = new JPanel(new HorizontalLayout(4));
         JPanel customBacktracersubPanel2 = new JPanel(new HorizontalLayout(4));
@@ -623,10 +799,13 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         stringRefsOptionssubPanel4.setBorder(new EmptyBorder(0,20,0,0));
         stringRefsOptionssubPanel5.setBorder(new EmptyBorder(0,20,0,0));
         stringRefsOptionssubPanel6.setBorder(new EmptyBorder(0,20,0,0));
+        stringRefsOptionssubPanel7.setBorder(new EmptyBorder(0,20,0,0));
+        stringRefsOptionssubPanel8.setBorder(new EmptyBorder(0,20,0,0));
         
         callTracingOptionssubPanel1.setBorder(new EmptyBorder(0,20,0,0));
         callTracingOptionssubPanel2.setBorder(new EmptyBorder(0,20,0,0));
         callTracingOptionssubPanel3.setBorder(new EmptyBorder(0,20,0,0));
+        callTracingOptionssubPanel4.setBorder(new EmptyBorder(0,20,0,0));
         
         
         TitledBorder HardwareWatchpointBorder =
@@ -635,6 +814,7 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         
         hardwareWatchpointsubPanel1.setBorder(new EmptyBorder(0,20,0,0));
         hardwareWatchpointsubPanel2.setBorder(new EmptyBorder(0,20,0,0));
+        hardwareWatchpointsubPanel3.setBorder(new EmptyBorder(0,20,0,0));
         
         
         TitledBorder CustomBackTracerBorder =
@@ -673,11 +853,13 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         callTracingOptionsPanel.add(StalkForCallTracingCheckBox,BorderLayout.NORTH);
         callTracingOptionssubPanel1.add(CallTracing_StalkOtherModulesCheckBox,BorderLayout.NORTH);
         callTracingOptionssubPanel3.add(CallTraceOutsideOurModuleCheckBox,BorderLayout.NORTH);
+        callTracingOptionssubPanel4.add(CallTracing_TraceBeforeOurModuleIsLoadedCheckBox,BorderLayout.NORTH);
         callTracingOptionssubPanel2.add(CallTracing_OnlyStalkThreadsWithNameCheckBox,BorderLayout.NORTH);
         callTracingOptionssubPanel2.add(CallTracing_OnlyStalkThreadsWithNameTextField,BorderLayout.NORTH);
 
         callTracingOptionsPanel.add(callTracingOptionssubPanel1,BorderLayout.NORTH); 
         callTracingOptionsPanel.add(callTracingOptionssubPanel3,BorderLayout.NORTH);
+        callTracingOptionsPanel.add(callTracingOptionssubPanel4,BorderLayout.NORTH);
         callTracingOptionsPanel.add(callTracingOptionssubPanel2,BorderLayout.NORTH);
 
 
@@ -685,6 +867,8 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         stringRefsOptionssubPanel5.add(StringRefs_StalkOtherModulesCheckBox,BorderLayout.NORTH);
         stringRefsOptionssubPanel1.add(StringRefs_AlsoIncludeStringsWithReferencesCheckBox,BorderLayout.NORTH);
         stringRefsOptionssubPanel6.add(StringRefs_AlsoInstrumentRegisterBasedAccessesCheckBox,BorderLayout.NORTH);
+        stringRefsOptionssubPanel7.add(StringRefs_AlsoInstrumentCallArgumentsCheckBox,BorderLayout.NORTH);
+        stringRefsOptionssubPanel8.add(StringRefs_AlsoInstrumentRegisterArithmeticCheckBox,BorderLayout.NORTH);
         stringRefsOptionssubPanel2.add(StringRefs_OnlyStalkThreadsWithNameCheckBox,BorderLayout.NORTH);
         stringRefsOptionssubPanel2.add(StringRefs_OnlyStalkThreadsWithNameTextField,BorderLayout.NORTH);
         stringRefsOptionssubPanel3.add(MaxTimesToLogEachStringReferenceLabel,BorderLayout.NORTH);
@@ -695,6 +879,8 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         stringRefsOptionsPanel.add(stringRefsOptionssubPanel5,BorderLayout.NORTH);
         stringRefsOptionsPanel.add(stringRefsOptionssubPanel1,BorderLayout.NORTH);
         stringRefsOptionsPanel.add(stringRefsOptionssubPanel6,BorderLayout.NORTH);
+        stringRefsOptionsPanel.add(stringRefsOptionssubPanel7,BorderLayout.NORTH);
+        stringRefsOptionsPanel.add(stringRefsOptionssubPanel8,BorderLayout.NORTH);
         stringRefsOptionsPanel.add(stringRefsOptionssubPanel2,BorderLayout.NORTH);
         stringRefsOptionsPanel.add(stringRefsOptionssubPanel3,BorderLayout.NORTH);
         stringRefsOptionsPanel.add(stringRefsOptionssubPanel4,BorderLayout.NORTH);
@@ -705,9 +891,12 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         hardwareWatchpointsubPanel1.add(MaxTimesLogWatchpointsComboBox,BorderLayout.NORTH);
         hardwareWatchpointsubPanel2.add(WatchpointTriggerOnOperationLabel,BorderLayout.NORTH);
         hardwareWatchpointsubPanel2.add(WatchpointTriggerOnOperationComboBox,BorderLayout.NORTH);
+        hardwareWatchpointsubPanel3.add(Watchpoints_OnlyUseThreadsWithNameCheckBox,BorderLayout.NORTH);
+        hardwareWatchpointsubPanel3.add(Watchpoints_OnlyUseThreadsWithNameTextField,BorderLayout.NORTH);
         
-        hardwareWatchpointPanel.add(hardwareWatchpointsubPanel1,BorderLayout.NORTH); 
+        hardwareWatchpointPanel.add(hardwareWatchpointsubPanel1,BorderLayout.NORTH);
         hardwareWatchpointPanel.add(hardwareWatchpointsubPanel2,BorderLayout.NORTH);
+        hardwareWatchpointPanel.add(hardwareWatchpointsubPanel3,BorderLayout.NORTH);
 
         
         customBacktracerPanel.add(CustomBackTraceFromSelectedAddressesCheckBox,BorderLayout.NORTH);
@@ -773,6 +962,10 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
         if (CallTraceOutsideOurModuleCheckBox.isEnabled() && CallTraceOutsideOurModuleCheckBox.isSelected()) {
             this.isCallTraceOutsideOurModuleCheckBoxchecked=true;
         }
+
+        if (CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.isEnabled() && CallTracing_TraceBeforeOurModuleIsLoadedCheckBox.isSelected()) {
+            this.isCallTracing_TraceBeforeOurModuleIsLoadedCheckBoxchecked=true;
+        }
         
         if (CallTracing_OnlyStalkThreadsWithNameCheckBox.isEnabled() && CallTracing_OnlyStalkThreadsWithNameCheckBox.isSelected()) {
             this.isCallTracing_OnlyStalkThreadsWithNameCheckBoxchecked=true;
@@ -802,12 +995,24 @@ public class DragonSelectionOptionsDialog extends DialogComponentProvider {
             this.isStringRefs_AlsoInstrumentRegisterBasedAccessesCheckBoxchecked=true;
         }
 
+        if (StringRefs_AlsoInstrumentCallArgumentsCheckBox.isEnabled() && StringRefs_AlsoInstrumentCallArgumentsCheckBox.isSelected()) {
+            this.isStringRefs_AlsoInstrumentCallArgumentsCheckBoxchecked=true;
+        }
+
+        if (StringRefs_AlsoInstrumentRegisterArithmeticCheckBox.isEnabled() && StringRefs_AlsoInstrumentRegisterArithmeticCheckBox.isSelected()) {
+            this.isStringRefs_AlsoInstrumentRegisterArithmeticCheckBoxchecked=true;
+        }
+
         if (StringRefs_OnlyStalkThreadsWithNameCheckBox.isEnabled() && StringRefs_OnlyStalkThreadsWithNameCheckBox.isSelected()) {
             this.isStringRefs_OnlyStalkThreadsWithNameCheckBoxchecked=true;
         }
 
         if (SetHardwareWatchPointCheckBox.isEnabled() && SetHardwareWatchPointCheckBox.isSelected()) {
             this.isSetHardwareWatchPointCheckBoxchecked=true;
+        }
+
+        if (Watchpoints_OnlyUseThreadsWithNameCheckBox.isEnabled() && Watchpoints_OnlyUseThreadsWithNameCheckBox.isSelected()) {
+            this.isWatchpoints_OnlyUseThreadsWithNameCheckBoxchecked=true;
         }
         
         if (CustomBackTraceFromSelectedAddressesCheckBox.isEnabled() && CustomBackTraceFromSelectedAddressesCheckBox.isSelected()) {

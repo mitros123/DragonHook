@@ -22,10 +22,8 @@ public class DragonAgentRunnerTaskDispatcher {
     {
         DragonAgentRunnerTask agent_runner_task=new DragonAgentRunnerTask("Running frida agent",this.current_program,this.incoming_plugintool);
         this.incoming_plugintool.execute(agent_runner_task); //Execute the task
-        if (agent_runner_task.is_cancelled)
-        {
-            return;
-        }
-
+        //Nothing follows, so there is nothing to skip: the "if (is_cancelled) return;" that used to sit here
+        //was a no-op guarding an empty tail, and it read as though cancellation were being handled.
+        //The flag itself is still set by the task, for anyone who does add something here.
     }
 }

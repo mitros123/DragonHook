@@ -129,6 +129,7 @@ public class DynamicCallTracingUtils {
         long total_number_of_instructions=current_program_listing.getNumInstructions();
         long number_of_instructions_examined=0;
         long number_of_computed_calls_found=0;
+        long number_of_computed_calls_below_the_image_base=0;
 
         incoming_monitor.setMessage("Precomputing the return addresses of computed calls...");
 
@@ -158,14 +159,31 @@ public class DynamicCallTracingUtils {
             {
                 long offset_right_after_the_call=current_instruction.getMinAddress().getOffset()
                         + current_instruction.getLength() - image_base_offset;
-                sb.append("\""+"0x"+Long.toHexString(offset_right_after_the_call)+"\":true,");
-                number_of_computed_calls_found+=1;
+                //A program can hold memory blocks BELOW its image base, which makes the offset negative.
+                //Long.toHexString() then renders it as sixteen hex digits starting with f, and the agent
+                //compares these keys against a NativePointer offset that can never look like that - so the
+                //entry was dead weight that could never match. Skip it and say so once.
+                if (offset_right_after_the_call<0)
+                {
+                    number_of_computed_calls_below_the_image_base+=1;
+                }
+                else
+                {
+                    sb.append("\""+"0x"+Long.toHexString(offset_right_after_the_call)+"\":true,");
+                    number_of_computed_calls_found+=1;
+                }
             }
         }
 
         sb.append("\"0xffffffffffff\":true}"); //dummy entry, so that the trailing comma above stays valid
         System.out.println("Precomputed "+Long.toString(number_of_computed_calls_found)
                 +" computed call return addresses, after examining "+Long.toString(number_of_instructions_examined)+" instructions");
+        if (number_of_computed_calls_below_the_image_base>0)
+        {
+            System.out.println("Skipped "+Long.toString(number_of_computed_calls_below_the_image_base)
+                    +" computed call(s) that live below the image base, because a negative module offset"
+                    +" cannot be expressed in the table the agent looks up.");
+        }
         return sb.toString();
     }
 
@@ -183,7 +201,10 @@ public class DynamicCallTracingUtils {
         
         retval+=sb.toString();
         retval+="\"0xffffffffffff\":0"; //dummy value
-        retval+="};";
+        //no trailing semicolon: set_dynamic_call_offsets_in_agent() appends its own, and emitting one here
+        //produced "...};;" in the agent. Matches what
+        //return_all_offsets_after_computed_calls_as_js_dict() already does.
+        retval+="}";
         return retval;
     }
     

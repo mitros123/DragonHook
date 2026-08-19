@@ -5,7 +5,8 @@ package dragonhook.tasks.custom_backtracer;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.Iterator;
 import java.util.regex.Pattern;
 
@@ -126,6 +127,22 @@ public class CustomBacktracerUtils {
         }
 
         
+        //FAIL FAST HERE. Every reflection step above catches its exception and carries on with a null, so
+        //a single renamed field in the Frida Hook Generator cascaded: null class -> NPE caught -> null
+        //instance -> NPE caught -> null field -> and then the setText() below, which is NOT inside a try,
+        //threw an uncaught NullPointerException out of the whole task. PackageChecker only proves the
+        //plugin class exists, not that its fields still do, so say plainly what is incompatible instead.
+        if (clazz_advhookoptionsdialog==null || clazz_apihandler==null || instance_advhookoptionsdialog==null
+            || field1==null || field2==null || field3==null)
+        {
+            String errorstr="Error, the installed Frida Hook Generator plugin does not expose the API"
+                    +" DragonHook expects (missing class, constructor or field). Its version is probably"
+                    +" incompatible with this version of DragonHook.";
+            cp.print_to_console(errorstr);
+            System.out.println(errorstr);
+            return errorstr;
+        }
+
         JTextField field1_value=null;
         try {
             field1_value = (JTextField) field1.get(instance_advhookoptionsdialog);
@@ -133,7 +150,15 @@ public class CustomBacktracerUtils {
             // TODO Auto-generated catch block
             e.printStackTrace();
         }
-        
+        if (field1_value==null)
+        {
+            String errorstr="Error, could not read IncludeCustomTextTextField from the Frida Hook Generator"
+                    +" dialog, so the backtracer hook cannot be generated.";
+            cp.print_to_console(errorstr);
+            System.out.println(errorstr);
+            return errorstr;
+        }
+
         field1_value.setText("console.log(custom_backtracer(this.context,"+backtracer_type+"));");
         
 
@@ -156,8 +181,8 @@ public class CustomBacktracerUtils {
             // TODO Auto-generated catch block
             e.printStackTrace();
         }
-        
-        
+
+
         //now invoke the method
         Method perform_hook_generation_method=null;
         try {
@@ -165,10 +190,18 @@ public class CustomBacktracerUtils {
         } catch (Exception e) {
             // TODO Auto-generated catch block
             e.printStackTrace();
-        } 
-        
-        
-        
+        }
+
+        //same reasoning as above: do not invoke on a null handle and let an NPE escape the task
+        if (instance_apihandler==null || perform_hook_generation_method==null)
+        {
+            String errorstr="Error, could not reach FridaHookGeneratorAPIHandler.perform_hook_generation()."
+                    +" The installed Frida Hook Generator plugin is probably an incompatible version.";
+            cp.print_to_console(errorstr);
+            System.out.println(errorstr);
+            return errorstr;
+        }
+
         try {
             retval=(String) perform_hook_generation_method.invoke(instance_apihandler);
         } catch (Exception e) {
@@ -184,20 +217,22 @@ public class CustomBacktracerUtils {
     
     
     
-    public static String extract_elements_of_hashset_as_address_str(HashSet<Address>hashset_of_collected_addresses)
+    public static String extract_elements_of_hashset_as_address_str(Set<Address>hashset_of_collected_addresses)
     {
 
+        //The Frida Hook Generator API expects "0073b575,0073b5a0". This used to append a comma after
+        //EVERY address and then a second one whenever another address followed, producing "A,,B,,C," -
+        //doubled separators plus a trailing one, so the address list handed to the hook generator was full
+        //of empty entries. Only put a separator BETWEEN addresses.
         StringBuilder sb=new StringBuilder();
         Iterator<Address> it = hashset_of_collected_addresses.iterator();
+        while (it.hasNext())
         {
-            while (it.hasNext()) {
-
-                Address nextaddr=it.next();
-                sb.append(nextaddr.toString()+",");
-                if(it.hasNext())
-                {
-                    sb.append(",");
-                }
+            Address nextaddr=it.next();
+            sb.append(nextaddr.toString());
+            if (it.hasNext())
+            {
+                sb.append(",");
             }
         }
         return sb.toString();
@@ -207,10 +242,14 @@ public class CustomBacktracerUtils {
     
     
 
+    //Returns null when the user cancelled, and "" when the selection genuinely held no instructions.
+    //Returning "" for both made a cancelled extraction indistinguishable from "nothing to hook", so the
+    //run carried on and quietly generated no hooks. Same convention as extract_strings_from_selection().
     public static String extract_str_with_hook_addresses_from_selection(Program current_program,ArrayList<AddressRange> incoming_addressrange_list, TaskMonitor incoming_monitor, boolean should_hook_function_starts_only)
     {
         String retval="";
-        HashSet<Address> hashset_of_collected_addresses= new HashSet<Address>();
+        //TreeSet for a deterministic, address sorted hook list - see the note in the regex variant below.
+        TreeSet<Address> hashset_of_collected_addresses= new TreeSet<Address>();
         Iterator<AddressRange> list_iter=incoming_addressrange_list.iterator();
         Listing current_program_listing=current_program.getListing();
         int list_cnt=0;
@@ -222,9 +261,8 @@ public class CustomBacktracerUtils {
             if (incoming_monitor.isCancelled())
             {
                 incoming_monitor.cancel();
-                retval="";
                 System.out.println("Extraction of addresses to hook is cancelled");
-                return retval;
+                return null;
             }
             incoming_monitor.setMessage("Extracting addresses to hook from selection ... "+Long.toString(list_cnt)+"/"+Long.toString(incoming_addressrange_list.size()));
             
@@ -243,9 +281,8 @@ public class CustomBacktracerUtils {
                     if (incoming_monitor.isCancelled())
                     {
                         incoming_monitor.cancel();
-                        retval="";
                         System.out.println("Extraction of addresses to hook is cancelled");
-                        return retval;
+                        return null;
                     }
                     incoming_monitor.setMessage("Extracting addresses to hook from selection .... "+Long.toString(list_cnt)+"/"+Long.toString(incoming_addressrange_list.size())+", "+Long.toString(cnt_for_addressrange)+"/"+Long.toString(current_address_range.getLength()));
                 }
@@ -266,18 +303,17 @@ public class CustomBacktracerUtils {
                     if (should_hook_function_starts_only)
                     {
                         Function container_function=current_program_listing.getFunctionContaining(codeunit_in_question.getMinAddress());
-                        if (container_function!=null && !hashset_of_collected_addresses.contains(container_function.getEntryPoint()))
+                        if (container_function!=null)
                         {
+                            //add() already deduplicates, the contains() check that used to guard it was
+                            //a second lookup for no benefit
                             hashset_of_collected_addresses.add(container_function.getEntryPoint());
                         }
                     }
                     else
                     {
                         //hook everything
-                        if (!hashset_of_collected_addresses.contains(codeunit_in_question.getMinAddress()))
-                        {
-                            hashset_of_collected_addresses.add(codeunit_in_question.getMinAddress());
-                        } 
+                        hashset_of_collected_addresses.add(codeunit_in_question.getMinAddress());
                     }
                     
                 }
@@ -296,17 +332,34 @@ public class CustomBacktracerUtils {
     
     
     
+    //Returns null when the user cancelled or when the regex itself is unusable, and "" when no function
+    //name matched.
     public static String extract_str_with_hook_addresses_for_function_regex(Program current_program, TaskMonitor incoming_monitor, String regex_for_fun_name)
     {
+        //The pattern comes straight from a GUI text field, so an unbalanced bracket is entirely likely.
+        //Pattern.compile() throws PatternSyntaxException, which nothing caught, so it escaped the whole
+        //task as a stack trace instead of telling the user their regex is wrong.
+        Pattern pattern=null;
+        try
+        {
+            pattern=Pattern.compile(regex_for_fun_name,Pattern.CASE_INSENSITIVE);
+        }
+        catch (Exception e)
+        {
+            System.out.println("Error, \""+regex_for_fun_name+"\" is not a valid regular expression: "+e.getMessage()
+                    +" . Note that the whole function name has to match, so use something like .*init.* rather than init.");
+            return null;
+        }
 
-        Pattern pattern= Pattern.compile(regex_for_fun_name,Pattern.CASE_INSENSITIVE);
         FunctionIterator fun_iter=current_program.getListing().getFunctions(true);
         int num_of_functions_processed=0;
-        HashSet<Address> hashset_of_collected_addresses= new HashSet<Address>();
+        //TreeSet, not HashSet: iteration order is then sorted by address instead of unspecified, so two
+        //identical runs emit the same hook list and the output can be diffed. The cost is O(log n) per
+        //insert instead of O(1), which is nothing next to the getFunctionContaining() database lookup that
+        //the selection path performs for every single instruction.
+        TreeSet<Address> hashset_of_collected_addresses= new TreeSet<Address>();
 
-        
-        
-        if (incoming_monitor.isCancelled()) {return "";}
+        if (incoming_monitor.isCancelled()) {return null;}
         incoming_monitor.setMessage("Extracting functions by regex...");
         
         while(fun_iter!=null && fun_iter.hasNext())
@@ -319,7 +372,7 @@ public class CustomBacktracerUtils {
             {
                 hashset_of_collected_addresses.add(newfun.getEntryPoint());        
             }
-            if (num_of_functions_processed%100==0 && incoming_monitor.isCancelled()) {return "";} //check for cancellation by the user
+            if (num_of_functions_processed%100==0 && incoming_monitor.isCancelled()) {return null;} //check for cancellation by the user
         }
         
 

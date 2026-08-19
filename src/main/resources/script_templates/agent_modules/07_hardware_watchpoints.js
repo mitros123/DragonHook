@@ -6,7 +6,46 @@ var watchpoint_ids_and_how_many_times_each_is_visited={};
 var exception_handler_has_been_installed=false;
 var array_of_objects_for_which_to_install_watchpoints=[{"address_offset_as_num":0xffffffffffff,"size":4,"operation":"r"}]; // UPDATED FROM DRAGONHOOK PLUGIN
 var max_times_each_watchpoint_is_logged=4; // UPDATED FROM DRAGONHOOK PLUGIN
-var queue_of_threads_for_which_watchpoint_will_be_added_when_the_module_is_loaded=[];
+
+//Whether rpc.exports.dispose() should disarm the watchpoints when the agent is unloaded. ON, because
+//leaving debug registers armed in a process we are walking away from is not something to do casually - but
+//it is the one step of the teardown that can block (unsetHardwareWatchpoint is a cross thread ptrace
+//operation, and a blocking call inside frida's C extension freezes the whole python interpreter). It runs
+//LAST in dispose() for exactly that reason, after the Stalker teardown that keeps the target alive.
+//Set it to false if a particular target reliably freezes on shutdown: the watchpoints then stay armed until
+//the process exits, which is a far better outcome than skipping the unload altogether and crashing it.
+var remove_watchpoints_on_dispose=true;
+
+//Same reasoning as the stalker restriction in module 05: at module scope so that the thread observer can
+//re-evaluate it when a thread is finally named.
+var str_to_be_included_in_thread_name_for_watchpoints=""; //UPDATED FROM DRAGONHOOK PLUGIN
+var there_is_a_restriction_for_the_thread_name_for_watchpoints=false;  //UPDATED FROM DRAGONHOOK PLUGIN
+
+
+//Whether a thread satisfies the user's watchpoint thread NAME restriction. A thread with no name yet does
+//not qualify, and onRenamed asks again once it has one.
+//Called from the thread observer, in both onAdded and onRenamed.
+function does_thread_pass_the_watchpoint_name_restriction(thread)
+{
+    if (!there_is_a_restriction_for_the_thread_name_for_watchpoints)
+    {
+        return true;
+    }
+    if (!thread || !thread.name)
+    {
+        return false;
+    }
+    return thread.name.toLowerCase().includes(str_to_be_included_in_thread_name_for_watchpoints);
+}
+//A SET of thread ids, keyed by the id, rather than an array of Thread objects. Two reasons:
+//  * frida hands every observer callback its own Thread object for the same thread, so removing an entry
+//    by object identity never matched and dead threads were left in the queue;
+//  * with an array, removal is a linear scan of the whole queue on every thread exit. Keyed by id,
+//    inserting and removing are both a single property operation and no search happens at all. The queue
+//    is only ever walked once, when it is drained.
+//The Thread object is looked up in dict_from_threadids_to_threads at drain time instead of being stored,
+//which also means a thread that has since exited is detected for free, by being absent from it.
+var threadids_queued_for_watchpoint_installation={};
 
 //The watchpoint id is a hardware debug register slot FOR ONE THREAD, not a process wide counter.
 //x86-64 has 4 debug registers and arm64 normally exposes 4 as well, so slots run 0..3 per thread.
@@ -796,11 +835,19 @@ function report_linux_ptrace_scope_once()
 //queue. Called (deferred) from the module observer once our module is found.
 function add_watchpoints_for_all_queued_threads()
 {
-    var queued_threads=queue_of_threads_for_which_watchpoint_will_be_added_when_the_module_is_loaded;
-    queue_of_threads_for_which_watchpoint_will_be_added_when_the_module_is_loaded=[]; //drain it, so a second call cannot install everything twice
-    for (var ind=0;ind<queued_threads.length;ind++)
+    var queued_thread_ids=threadids_queued_for_watchpoint_installation;
+    threadids_queued_for_watchpoint_installation={}; //drain it first, so a second call cannot install everything twice
+    for (var thread_id_str in queued_thread_ids)
     {
-        add_all_configured_watchpoints_for_a_thread(queued_threads[ind]);
+        //resolved now rather than stored earlier: the object is fresh, and a thread that has exited is
+        //recognised simply by no longer being in this dictionary
+        var thread_object_for_queued_id=dict_from_threadids_to_threads[thread_id_str];
+        if (!thread_object_for_queued_id)
+        {
+            console.log("Not installing watchpoints on thread "+thread_id_str+", it has exited since being queued");
+            continue;
+        }
+        add_all_configured_watchpoints_for_a_thread(thread_object_for_queued_id);
     }
 }
 
@@ -834,6 +881,89 @@ function remove_all_installed_watchpoints_for_all_threads()
             remove_all_installed_watchpoints_for_a_thread(thread_object);
         }
     }
+}
+
+
+//Removes every watchpoint of ours whose WATCHED address falls inside the given absolute range, and forgets
+//only those. The addresses in threads_and_watchpoint_ids are absolute - setHardwareWatchpoint() keys them by
+//address.toString() - which is the only reason one mapping's watchpoints can be told from another's at all.
+//
+//Called by the module unload teardown in place of the wholesale remover above, because that teardown is
+//deferred and by the time it runs the module may have been mapped again SOMEWHERE ELSE. The new mapping's
+//watchpoints are live and have to survive; only the ones watching the dead range are stale. It also means a
+//watchpoint armed by hand outside our module, from the DRAGONHOOK CODE marker, is no longer collateral damage
+//when our module goes away.
+//
+//Entries are DELETED rather than merely unset. safely_unset_hardware_watchpoint() only marks them
+//"uninstalled", and do_we_have_any_watchpoint_bookkeeping_for_thread() answers true for ANY entry regardless
+//of that flag - so leaving them behind would keep the exception handler claiming traps on a thread that no
+//longer has a single watchpoint of ours, and would keep the slot allocator treating their debug registers as
+//occupied.
+function remove_installed_watchpoints_watching_addresses_in_range(start_of_range,end_of_range)
+{
+    var number_of_watchpoints_removed=0;
+    for (var thread_id_to_str in threads_and_watchpoint_ids)
+    {
+        var bookkeeping_for_thread=threads_and_watchpoint_ids[thread_id_to_str];
+        if (!bookkeeping_for_thread)
+        {
+            continue;
+        }
+        for (var addr_str in bookkeeping_for_thread)
+        {
+            var watched_address;
+            try { watched_address=ptr(addr_str); }
+            catch (err) { continue; }   //not an address we can reason about, so leave it alone
+            if (watched_address.compare(start_of_range)<0 || watched_address.compare(end_of_range)>=0)
+            {
+                continue;   //belongs to another mapping, or was armed by hand outside our module
+            }
+            var watchpoint_id_to_uninstall=bookkeeping_for_thread[addr_str][0];
+            //Guarded per ENTRY. The whole purpose of this sweep is that nothing is left armed, so one thread
+            //that throws must not abandon the others - and the caller's try/catch sits outside the loop, so
+            //without this a single failure ended the sweep wherever it happened to be.
+            //The call also has to run while the entry is still present: safely_unset_hardware_watchpoint()
+            //looks itself up in threads_and_watchpoint_ids rather than taking the entry as an argument.
+            var it_was_unset=false;
+            try
+            {
+                it_was_unset=safely_unset_hardware_watchpoint(thread_id_to_str,watchpoint_id_to_uninstall,addr_str);
+            }
+            catch (err)
+            {
+                console.log('Could not unset hardware watchpoint '+watchpoint_id_to_uninstall+' for thread '
+                    +thread_id_to_str+' watching '+addr_str+': '+err);
+            }
+            if (it_was_unset)
+            {
+                //describe_thread_by_id() reaches into the thread object, so it gets its own guard rather than
+                //being able to take the sweep down over a log line
+                try
+                {
+                    console.log('Disabled hardware watchpoint '+watchpoint_id_to_uninstall+' for '
+                        +describe_thread_by_id(thread_id_to_str)+' and watched address '+addr_str);
+                }
+                catch (err)
+                {
+                    console.log('Disabled hardware watchpoint '+watchpoint_id_to_uninstall+' for thread '
+                        +thread_id_to_str+' and watched address '+addr_str);
+                }
+            }
+            //dropped either way. The module is gone, so there is nothing to retry, and keeping the entry would
+            //leave do_we_have_any_watchpoint_bookkeeping_for_thread() claiming traps for it forever.
+            delete watchpoint_ids_and_how_many_times_each_is_visited[
+                return_watchpoint_visit_key(thread_id_to_str,watchpoint_id_to_uninstall)];
+            delete bookkeeping_for_thread[addr_str];   //deleting the key being visited is safe in a for..in
+            number_of_watchpoints_removed+=1;
+        }
+        //do_we_have_any_watchpoint_bookkeeping_for_thread() already answers false for an emptied table, so
+        //this is only housekeeping - it stops empty per thread tables accumulating for the life of the process
+        if (Object.keys(bookkeeping_for_thread).length===0)
+        {
+            delete threads_and_watchpoint_ids[thread_id_to_str];
+        }
+    }
+    return number_of_watchpoints_removed;
 }
 
 

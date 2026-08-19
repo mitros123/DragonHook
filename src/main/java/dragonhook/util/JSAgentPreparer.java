@@ -71,9 +71,17 @@ public class JSAgentPreparer {
                 "var module_name_to_hook='"+current_program.getName()+"'; var ghidra_base_of_module_to_hook=0x"+Long.toHexString(current_program.getImageBase().getOffset())+"; // UPDATED FROM DRAGONHOOK PLUGIN\n"
                 + "var module_name_"+current_program_name_sanitized+"=module_name_to_hook;\n",
                 true);
-        change_specific_line_in_agent_file("module_name_to_hook=module.name; modulename_to_stalk=module.name; //Update the variables to the proper case if needed , UPDATED FROM DRAGONHOOK PLUGIN",
-                "module_name_to_hook=module.name; modulename_to_stalk=module.name; module_name_"+current_program_name_sanitized+"=module_name_to_hook; //Update the variables to the proper case if needed , UPDATED FROM DRAGONHOOK PLUGIN",
-                false);
+        //This anchor is the SHORT prefix of the line, and the line is replaced WHOLE, so that preparing the
+        //same agent file a second time still works. It used to match the full original line and patch it
+        //by substring, which meant that once the line had been patched for one program the anchor no
+        //longer matched at all - the second preparation silently did nothing, leaving the previous
+        //program's alias being assigned here. That only became reachable when DragonHookPlugin started
+        //re-preparing the agent on a program switch; before that the agent was only ever prepared once,
+        //against a freshly written file.
+        //The replacement deliberately keeps this prefix intact, which is what makes the anchor survive.
+        change_specific_line_in_agent_file("module_name_to_hook=module.name; modulename_to_stalk=module.name;",
+                "            module_name_to_hook=module.name; modulename_to_stalk=module.name; module_name_"+current_program_name_sanitized+"=module_name_to_hook; //Update the variables to the proper case if needed , UPDATED FROM DRAGONHOOK PLUGIN",
+                true);
     }
         
     
@@ -119,6 +127,19 @@ public class JSAgentPreparer {
     }
     
     
+    //The agent has always carried these two variables, marked "UPDATED FROM DRAGONHOOK PLUGIN", but
+    //nothing ever wrote them, so the watchpoint thread filter was permanently off. A watchpoint has to be
+    //installed on EVERY thread separately, and each cross thread install needs the OS to grant access to
+    //that thread, so restricting the set of threads is worth having.
+    public static void set_name_of_threads_for_watchpoints(String str_that_must_be_included_in_thread_names)
+    {
+        change_specific_line_in_agent_file("var there_is_a_restriction_for_the_thread_name_for_watchpoints=",
+                "var there_is_a_restriction_for_the_thread_name_for_watchpoints=true;//",false);
+        change_specific_line_in_agent_file("var str_to_be_included_in_thread_name_for_watchpoints=",
+                "var str_to_be_included_in_thread_name_for_watchpoints=\""+str_that_must_be_included_in_thread_names+"\";//",false);
+    }
+
+
     public static void enable_stalking_of_dynamic_calls()
     {
         change_specific_line_in_agent_file("var dynamic_call_stalking_is_enabled=",
@@ -172,7 +193,10 @@ public class JSAgentPreparer {
     
     public static void enable_string_reference_resolution(String js_object_with_strings_to_resolve,
                                                          String max_times_to_log_each_reference,
-                                                         boolean also_instrument_register_based_memory_accesses)
+                                                         boolean also_instrument_register_based_memory_accesses,
+                                                         boolean also_instrument_call_arguments,
+                                                         boolean also_instrument_register_arithmetic,
+                                                         boolean stalk_other_modules)
     {
         change_specific_line_in_agent_file("var string_reference_resolution_is_enabled=",
                 "var string_reference_resolution_is_enabled=true; // UPDATED FROM DRAGONHOOK PLUGIN", true);
@@ -183,6 +207,18 @@ public class JSAgentPreparer {
         change_specific_line_in_agent_file("var also_instrument_register_based_memory_accesses=",
                 "var also_instrument_register_based_memory_accesses="
                 +(also_instrument_register_based_memory_accesses ? "true" : "false")
+                +"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+        change_specific_line_in_agent_file("var string_refs_instrument_call_arguments=",
+                "var string_refs_instrument_call_arguments="
+                +(also_instrument_call_arguments ? "true" : "false")
+                +"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+        change_specific_line_in_agent_file("var string_refs_instrument_register_arithmetic=",
+                "var string_refs_instrument_register_arithmetic="
+                +(also_instrument_register_arithmetic ? "true" : "false")
+                +"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+        change_specific_line_in_agent_file("var string_refs_stalk_other_modules=",
+                "var string_refs_stalk_other_modules="
+                +(stalk_other_modules ? "true" : "false")
                 +"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
 
         //the string table only becomes usable once the module base is known
@@ -221,6 +257,19 @@ public class JSAgentPreparer {
         
     }
     
+    //Lets call tracing start before the examined module exists. Only meaningful together with an
+    //unfiltered trace, because the "ignore call/rets outside our module" filter is the only thing in the
+    //agent's receiver that needs the module's bounds. The dialog enforces that dependency, and the agent
+    //checks it again in is_early_call_tracing_active().
+    public static void set_call_tracing_before_our_module_is_loaded(boolean trace_before_the_module_is_loaded)
+    {
+        change_specific_line_in_agent_file("var call_tracing_before_our_module_is_loaded=",
+                "var call_tracing_before_our_module_is_loaded="
+                +(trace_before_the_module_is_loaded ? "true" : "false")
+                +"; // UPDATED FROM DRAGONHOOK PLUGIN", true);
+    }
+
+
     public static void add_custom_hooks(String custom_hooks_to_add)
     {
         change_specific_line_in_agent_file("//DRAGONHOOK CODE GOES HERE, DO NOT REMOVE THIS LINE",

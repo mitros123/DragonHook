@@ -16,6 +16,13 @@ public class DragonEditConfigAction extends DockingAction {
 
     protected PluginTool tool;
     protected Program current_program;
+
+    //Called by DragonHookPlugin.programActivated/programDeactivated. Without this the program captured
+    //when the action was constructed was used forever, so after switching program in Ghidra every offset
+    //and every comment went to the WRONG program's database.
+    public void set_current_program(Program incoming_program) {
+        this.current_program=incoming_program;
+    }
     protected ProgramSelection incoming_selection;
     protected Plugin incoming_plugin;
 

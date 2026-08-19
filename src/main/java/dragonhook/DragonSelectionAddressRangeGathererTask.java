@@ -19,7 +19,13 @@ import ghidra.util.task.TaskMonitor;
 
 public class DragonSelectionAddressRangeGathererTask extends Task {
 
-    public Boolean is_cancelled;
+    //volatile, and a primitive rather than a boxed Boolean. It is written on the ghidra task thread and read
+    //on the thread that called PluginTool.execute() (DragonSelectionTaskDispatcher). That launcher blocks and
+    //joins, so a happens-before edge does exist today - but by accident of the launcher's implementation
+    //rather than by anything declared here, and the other cross-thread flags in this plugin
+    //(the_running_python_process, the_agent_was_force_stopped) are already volatile. The primitive also means
+    //a plain "if (task.is_cancelled)" can never unbox a null.
+    public volatile boolean is_cancelled;
     public ArrayList<CodeUnit> code_units_for_instructions_that_are_gathered;
     public ArrayList<AddressRange> address_ranges_that_are_gathered;
     public ArrayList<AddressRangeMinMaxContainer> min_max_addresses_in_address_ranges;
@@ -161,19 +167,44 @@ public class DragonSelectionAddressRangeGathererTask extends Task {
             AddressRangeMinMaxContainer cont=new AddressRangeMinMaxContainer(minaddr,maxaddr,min_code_unit,max_code_unit);
             this.min_max_addresses_in_address_ranges.add(cont);
                         
+            //Cancellation is tested on EVERY iteration, not every hundredth. A selection of one range - the
+            //ordinary case - never reached a hundred, so the task could be cancelled by the user and finish
+            //normally with is_cancelled still false, which is exactly the lie the flag exists to prevent.
+            //The cost is a boolean read next to two ghidra database lookups already in this loop.
+            if (monitor.isCancelled())
+            {
+                //The two lists are assigned BEFORE the flag, and the flag last. is_cancelled is volatile, so
+                //writing it is a release: everything written before it is visible to whoever reads it as true.
+                //Written first instead - which is how this used to read - the barrier would sit in front of the
+                //two plain assignments and guarantee nothing about them, so a reader could see is_cancelled true
+                //while both lists were still the populated ones. It happens to work today only because
+                //PluginTool.execute() blocks and joins, which is the very accident the volatile exists to stop
+                //depending on.
+                this.address_ranges_that_are_gathered=new ArrayList<AddressRange>();
+                this.min_max_addresses_in_address_ranges=new ArrayList<AddressRangeMinMaxContainer>();
+                monitor.cancel();
+                System.out.println("Address Range Gathering Task is cancelled");
+                this.is_cancelled=true;
+                return;
+            }
+            //the message is still only refreshed periodically, since that one does cost something
             if (cnt2 % 100==0)
             {
-                if (monitor.isCancelled())
-                {
-                    this.is_cancelled=true;
-                    monitor.cancel();
-                    this.address_ranges_that_are_gathered=new ArrayList<AddressRange>();
-                    this.min_max_addresses_in_address_ranges=new ArrayList<AddressRangeMinMaxContainer>(); 
-                    System.out.println("Address Range Gathering Task is cancelled");
-                    return;
-                }
                 monitor.setMessage("Gathering Address Ranges ... "+Integer.toString(cnt2)+"/"+Integer.toString(num_of_total_address_ranges_selected));
             }
+        }
+
+        //A cancel arriving after the last iteration would otherwise go unrecorded, and DragonSelectionTask
+        //decides whether to apply anything by reading this flag.
+        if (monitor.isCancelled())
+        {
+            //lists first, volatile flag last, for the publication reason given at the in-loop check above
+            this.address_ranges_that_are_gathered=new ArrayList<AddressRange>();
+            this.min_max_addresses_in_address_ranges=new ArrayList<AddressRangeMinMaxContainer>();
+            monitor.cancel();
+            System.out.println("Address Range Gathering Task is cancelled");
+            this.is_cancelled=true;
+            return;
         }
         cp.print_to_console("Got all the address ranges for the selected addresses.");
         System.out.println("Got all the address ranges for the selected addresses.");

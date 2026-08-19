@@ -30,6 +30,10 @@ public class CreatorOfNecessaryFiles {
     
     //This fetches the settings dir, using the builtin methods
     //https://github.com/NationalSecurityAgency/ghidra/blob/7765e8338bb9f866ce31ba98059243f0af2ca80d/Ghidra/RuntimeScripts/Common/support/launch.properties#L86-L127
+    //NEVER returns null. It used to return null on failure and get_dir_for_DragonhookPlugin_files() then
+    //called .toPath() on it, so a settings directory that could not be resolved surfaced as a bare
+    //NullPointerException with no hint about what had actually gone wrong. There is no sensible fallback -
+    //every file this plugin owns lives under that directory - so fail loudly and say why.
     public static File get_ghidra_settings_dir()
     {
     	ApplicationProperties app_properties = Application.getApplicationLayout().getApplicationProperties();
@@ -44,6 +48,14 @@ public class CreatorOfNecessaryFiles {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
+    	if (settings_dir==null)
+    	{
+    	    String errorstr="DragonHook: could not determine Ghidra's user settings directory, so the"
+    	            +" plugin cannot create its config, agent or python invoker files. See the exception"
+    	            +" printed above this message.";
+    	    System.out.println(errorstr);
+    	    throw new RuntimeException(errorstr);
+    	}
     	return settings_dir;
     }
     
@@ -54,6 +66,8 @@ public class CreatorOfNecessaryFiles {
         return path_for_dragonhook_dir;
     }
     
+    //Same reasoning as get_ghidra_settings_dir(): DragonAgentRunnerTask calls .toPath() on the result
+    //straight away, so returning null only moved the failure somewhere less informative.
     public static File get_ghidra_user_temp_dir()
     {
         File tmp_dir=null;
@@ -65,6 +79,13 @@ public class CreatorOfNecessaryFiles {
         } catch (IOException e) {
             // TODO Auto-generated catch block
             e.printStackTrace();
+        }
+        if (tmp_dir==null)
+        {
+            String errorstr="DragonHook: could not determine Ghidra's user temp directory, so the agent"
+                    +" stdout/stderr files cannot be written. See the exception printed above this message.";
+            System.out.println(errorstr);
+            throw new RuntimeException(errorstr);
         }
         return tmp_dir;
     }
@@ -130,14 +151,18 @@ public class CreatorOfNecessaryFiles {
 
         if (!fileexists)
         {
-            try {
-                BufferedWriter writer = Files.newBufferedWriter(path_for_file);
+            //try-with-resources, so the handle is released on the failing path too. It used to be a bare
+            //new/write/close, which leaked the writer whenever write() threw and, worse, could leave a
+            //PARTIALLY written file behind: non-zero length, so the empty-file guard above considered it
+            //valid from then on and it was never rewritten. Delete the remains so the next run retries.
+            try (BufferedWriter writer = Files.newBufferedWriter(path_for_file)) {
                 writer.write(contents);
                 writer.flush();
-                writer.close();
             } catch (IOException e) {
-                // TODO Auto-generated catch block
+                System.out.println("DragonHook: could not write \""+path_for_file_as_str+"\": "+e
+                        +" . Removing the partial file so that it is recreated on the next attempt.");
                 e.printStackTrace();
+                try { Files.deleteIfExists(path_for_file); } catch (IOException e2) { e2.printStackTrace(); }
             }
         }
         return path_for_file_as_str;
@@ -156,12 +181,32 @@ public class CreatorOfNecessaryFiles {
         Path path_for_dragonhook_dir=CreatorOfNecessaryFiles.get_dir_for_DragonhookPlugin_files();
         Path path_for_config = path_for_dragonhook_dir.resolve(config_file_name);
         String path_for_config_as_str = path_for_config.toString();
-        File config_file_obj = new File(path_for_config_as_str);
-        config_file_obj.delete();
+        delete_file_for_reset(path_for_config);
         path_for_config_as_str = CreatorOfNecessaryFiles.createConfigFile();
         return path_for_config_as_str;
     }
     
+    //Deleting the file is the whole of a "reset": createXFile() only writes when the file is absent or
+    //empty, so if the delete silently fails - locked by an editor on windows, read only, wrong owner - the
+    //reset reports success and changes nothing at all. Report it instead.
+    private static boolean delete_file_for_reset(Path path_for_file)
+    {
+        File file_to_delete=path_for_file.toFile();
+        if (!file_to_delete.exists())
+        {
+            return true;   //nothing to remove, which is the state a reset wants anyway
+        }
+        boolean the_file_was_deleted=file_to_delete.delete();
+        if (!the_file_was_deleted)
+        {
+            System.out.println("DragonHook: could not delete \""+path_for_file.toString()+"\", so it was NOT"
+                    +" reset to its default. It may be open in another program, or read only. Close it and"
+                    +" try again, or delete it by hand.");
+        }
+        return the_file_was_deleted;
+    }
+
+
     //The agent is kept as separate modules so that it can be worked on in pieces, and they are
     //concatenated into the single file that the python invoker loads and that JSAgentPreparer patches.
     //
@@ -257,8 +302,7 @@ public class CreatorOfNecessaryFiles {
         Path path_for_dragonhook_dir=CreatorOfNecessaryFiles.get_dir_for_DragonhookPlugin_files();
         Path path_for_agent = path_for_dragonhook_dir.resolve(agent_file_name);
         String path_for_agent_as_str = path_for_agent.toString();
-        File agent_file_obj = new File(path_for_agent_as_str);
-        agent_file_obj.delete();
+        delete_file_for_reset(path_for_agent);
         path_for_agent_as_str = CreatorOfNecessaryFiles.createAgentFile();
         return path_for_agent_as_str;
     }
@@ -276,17 +320,16 @@ public class CreatorOfNecessaryFiles {
         Path path_for_dragonhook_dir=CreatorOfNecessaryFiles.get_dir_for_DragonhookPlugin_files();
         Path path_for_python_invoker = path_for_dragonhook_dir.resolve(python_invoker_file_name);
         String path_for_python_invoker_as_str = path_for_python_invoker.toString();
-        File python_invoker_file_obj = new File(path_for_python_invoker_as_str);
-        python_invoker_file_obj.delete();
+        delete_file_for_reset(path_for_python_invoker);
         path_for_python_invoker_as_str = CreatorOfNecessaryFiles.createPythonInvokerFile();
         return path_for_python_invoker_as_str;
     }
     
     public static void createAllNecessaryFiles()
     {
-        String path_for_config_as_str = CreatorOfNecessaryFiles.createConfigFile();
-        String path_for_agent_as_str = CreatorOfNecessaryFiles.createAgentFile();
-        String path_for_python_invoker_as_str = CreatorOfNecessaryFiles.createPythonInvokerFile();
+        CreatorOfNecessaryFiles.createConfigFile();
+        CreatorOfNecessaryFiles.createAgentFile();
+        CreatorOfNecessaryFiles.createPythonInvokerFile();
         DOSLimitsTracker.initialize_max_limits_from_config();
     }
     

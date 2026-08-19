@@ -21,6 +21,12 @@ public class WatchpointProcessingUtils {
     
 
     //This should finish instantly. Watchpoints should not be set for over than 2-3 addresses.
+    //
+    //Returns null when the user cancelled, and an empty list when the selection genuinely held no code
+    //units. Returning an empty list for both made the two indistinguishable, so a cancelled extraction
+    //looked exactly like "nothing selected" and the caller carried on to configure zero watchpoints.
+    //null is the same convention extract_strings_from_selection() already uses, so callers must null
+    //check before touching the result.
     public static ArrayList<CodeUnit> extract_selection_as_arraylist_of_codeunits(Program current_program,ArrayList<AddressRange> incoming_addressrange_list, TaskMonitor incoming_monitor)
     {
         ArrayList<CodeUnit> retval=new ArrayList<CodeUnit>();
@@ -35,9 +41,8 @@ public class WatchpointProcessingUtils {
             if (incoming_monitor.isCancelled())
             {
                 incoming_monitor.cancel();
-                retval=new ArrayList<CodeUnit>();
-                System.out.println("Extraction of dynamic calls task is cancelled");
-                return retval;
+                System.out.println("Extraction of codeunits to set watchpoints task is cancelled");
+                return null;
             }
             incoming_monitor.setMessage("Extracting codeunits to set watchpoints ... "+Long.toString(list_cnt)+"/"+Long.toString(incoming_addressrange_list.size()));
             
@@ -56,9 +61,8 @@ public class WatchpointProcessingUtils {
                     if (incoming_monitor.isCancelled())
                     {
                         incoming_monitor.cancel();
-                        retval=new ArrayList<CodeUnit>();
                         System.out.println("Extraction of codeunits to set watchpoints task is cancelled");
-                        return retval;
+                        return null;
                     }
                     incoming_monitor.setMessage("Extracting codeunits to set watchpoints ... "+Long.toString(list_cnt)+"/"+Long.toString(incoming_addressrange_list.size())+", "+Long.toString(cnt_for_addressrange)+"/"+Long.toString(current_address_range.getLength()));
                 }
@@ -122,9 +126,11 @@ public class WatchpointProcessingUtils {
             }
         }
 
-        retval+=sb.toString(); 
-        retval+="];";
-        return retval;  
+        retval+=sb.toString();
+        //no trailing semicolon: JSAgentPreparer.set_array_of_watchpoints() appends its own, and emitting
+        //one here produced "...}];;" in the agent
+        retval+="]";
+        return retval;
     }
     
 }

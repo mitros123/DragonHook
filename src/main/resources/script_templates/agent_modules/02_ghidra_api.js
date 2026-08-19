@@ -32,7 +32,13 @@ function get_function_data_from_ghidra_given_address_offset(address_offset)
     }
     //else
     var line_to_send='|||DH_GHIDRA_API_CALL:{"FUNCTION":"FUN_DATA_GIVEN_ADDR_OFFSET","PARAMS":["'+address_offset_as_str+'"]}|||\n'
-    send(line_to_send)
+    if (!send_protocol_line_to_python(line_to_send))
+    {
+        //Deliberately leaves the cache untouched: do_we_have_proper_function_data_given_address_offset()
+        //reads the CACHE rather than this return value, finds no entry, and JSON.parse(undefined) throws
+        //there - so it reports false, exactly as it does for a malformed reply. No caller has to change.
+        return "Error, the channel to python is gone, no function data can arrive";
+    }
     var str_to_ret;
     var response=recv('api-response-FUN_DATA_GIVEN_ADDR_OFFSET-[\''+address_offset_as_str+'\']', //python puts single quotes in this case for some reason...
         function onrecv(fun_data)
@@ -76,7 +82,12 @@ function get_codeunit_data_from_ghidra_given_address_offset(address_offset)
     }
     //else
     var line_to_send='|||DH_GHIDRA_API_CALL:{"FUNCTION":"CODEUNIT_DATA_GIVEN_ADDR_OFFSET","PARAMS":["'+address_offset_as_str+'"]}|||\n'
-    send(line_to_send)
+    if (!send_protocol_line_to_python(line_to_send))
+    {
+        //as above: nothing cached, so do_we_have_proper_codeunit_data_given_address_offset() reports false
+        //and get_codeunit_information_as_dict() returns null, which every caller already handles
+        return "Error, the channel to python is gone, no codeunit data can arrive";
+    }
     var str_to_ret;
     var response=recv('api-response-CODEUNIT_DATA_GIVEN_ADDR_OFFSET-[\''+address_offset_as_str+'\']', //python puts single quotes in this case for some reason...
         function onrecv(fun_data)
@@ -207,7 +218,13 @@ function get_full_function_data_by_ranges()
         return "the bulk function data fetch already failed once, not retrying it";
     }
     var line_to_send='|||DH_GHIDRA_API_CALL:{"FUNCTION":"ALL_FUN_DATA_SORTED_BY_RANGESTART","PARAMS":[]}|||\n'
-    send(line_to_send)
+    if (!send_protocol_line_to_python(line_to_send))
+    {
+        //the channel does not come back, so latch the failure and let every later lookup take the early exit
+        //above instead of re-issuing the whole table request per address
+        bulk_function_data_fetch_has_failed=true;
+        return "Error, the channel to python is gone, the function range table cannot be fetched";
+    }
     var str_that_is_returned;
     var response=recv('api-response-ALL_FUN_DATA_SORTED_BY_RANGESTART-[]',
         function onrecv(fun_data)
@@ -296,7 +313,11 @@ function update_ghidradb_with_comment_at_addr(offset_of_address_to_update,commen
     }
     var address_offset_as_str="0x"+offset_of_address_to_update.toString(16);
     var line_to_send='|||DH_GHIDRA_API_CALL:{"FUNCTION":"UPDATE_GHIDRADB_WITH_COMMENT_AT_ADDR","PARAMS":[\"'+address_offset_as_str+'\",'+JSON.stringify(comment_to_update_with)+']}|||\n'
-    send(line_to_send)
+    if (!send_protocol_line_to_python(line_to_send))
+    {
+        //returned before the count is bumped, since that count tracks traffic that really went out
+        return "Error, the channel to python is gone, the comment was not sent";
+    }
     count_one_ghidradb_update_for_addr(offset_of_address_to_update);
 
     //recv() registers a one-shot pending handler keyed by the type string. Registering one and then
@@ -340,7 +361,11 @@ function update_ghidradb_with_xref(offset_of_address_from,offset_of_address_to,t
     var address_offset_from_as_str="0x"+offset_of_address_from.toString(16);
     var address_offset_to_as_str="0x"+offset_of_address_to.toString(16);
     var line_to_send='|||DH_GHIDRA_API_CALL:{"FUNCTION":"UPDATE_GHIDRADB_WITH_XREF","PARAMS":[\"'+address_offset_from_as_str+'\",\"'+address_offset_to_as_str+'\",\"'+type_of_xref+'\"]}|||\n'
-    send(line_to_send)
+    if (!send_protocol_line_to_python(line_to_send))
+    {
+        //again before the count, for the same reason
+        return "Error, the channel to python is gone, the xref was not sent";
+    }
     count_one_ghidradb_update_for_addr(offset_of_address_from);   //the referencing side is the one that floods
 
     //see the note in update_ghidradb_with_comment_at_addr(): no recv() handler on the async path
@@ -385,7 +410,10 @@ function update_ghidradb_with_memory_contents(offset_of_starting_address_to_upda
     var u8=new Uint8Array(bytes_from_mem);
     var decimalarray=Array.from(u8)
     var line_to_send='|||DH_GHIDRA_API_CALL:{"FUNCTION":"CHANGE_BYTES_INSIDE_GHIDRADB","PARAMS":[\"'+address_offset_as_str+'\",\"'+JSON.stringify(decimalarray)+'\"]}|||\n'
-    send(line_to_send)
+    if (!send_protocol_line_to_python(line_to_send))
+    {
+        return "Error, the channel to python is gone, the memory contents were not sent";
+    }
 
     //see the note in update_ghidradb_with_comment_at_addr(): no recv() handler on the async path
     if (memory_updates_to_ghidradb_are_asynchronous)

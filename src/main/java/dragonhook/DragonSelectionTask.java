@@ -20,7 +20,9 @@ import ghidra.util.task.TaskMonitor;
 
 public class DragonSelectionTask extends Task {
 
-    public Boolean is_cancelled;
+    //volatile primitive, for the reason spelled out on the same field in
+    //DragonSelectionAddressRangeGathererTask: written on the task thread, read by the dispatcher on another.
+    public volatile boolean is_cancelled;
     protected PluginTool incoming_plugintool;
     protected Program current_program;
     protected DragonSelectionOptionsDialog incoming_selection_options_dialog;
@@ -45,6 +47,20 @@ public class DragonSelectionTask extends Task {
     public void run(TaskMonitor monitor) throws CancelledException {
         
         ConsolePrinter cp=new ConsolePrinter(this.incoming_plugintool);
+
+        //The address range gathering runs as its OWN task, with its own monitor, and on cancel it returns an
+        //empty range list - which is intended, but it means a cancelled gather is indistinguishable from
+        //"nothing was selected" unless its flag is consulted. Our own monitor is not necessarily cancelled,
+        //so without this check every feature below would carry on against zero addresses and report that it
+        //found nothing, as though the selection had been empty.
+        if (this.code_unit_gatherer_task!=null && this.code_unit_gatherer_task.is_cancelled)
+        {
+            cp.print_to_console("Gathering of the selected address ranges was cancelled, so nothing is applied.");
+            this.is_cancelled=true;
+            monitor.cancel();
+            return;
+        }
+
         monitor.setMessage("Altering JS agent according to options... ");
         if (this.incoming_selection_options_dialog.isResetAgentContentsBeforePerformingChangesCheckBoxchecked)
         {
@@ -142,7 +158,10 @@ public class DragonSelectionTask extends Task {
 
             JSAgentPreparer.set_whether_only_our_module_is_stalked(
                     !this.incoming_selection_options_dialog.isCallTracing_StalkOtherModulesCheckBoxchecked);
-            
+
+            JSAgentPreparer.set_call_tracing_before_our_module_is_loaded(
+                    this.incoming_selection_options_dialog.isCallTracing_TraceBeforeOurModuleIsLoadedCheckBoxchecked);
+
             if (this.incoming_selection_options_dialog.isCallTracing_OnlyStalkThreadsWithNameCheckBoxchecked)
             {
                 String str_that_is_included_in_threadnames=incoming_selection_options_dialog.CallTracing_OnlyStalkThreadsWithNameTextField.getText();
@@ -190,7 +209,10 @@ public class DragonSelectionTask extends Task {
                 JSAgentPreparer.enable_string_reference_resolution(
                         js_object_with_strings_to_resolve,
                         (String) this.incoming_selection_options_dialog.MaxTimesToLogEachStringReferenceComboBox.getSelectedItem(),
-                        this.incoming_selection_options_dialog.isStringRefs_AlsoInstrumentRegisterBasedAccessesCheckBoxchecked);
+                        this.incoming_selection_options_dialog.isStringRefs_AlsoInstrumentRegisterBasedAccessesCheckBoxchecked,
+                        this.incoming_selection_options_dialog.isStringRefs_AlsoInstrumentCallArgumentsCheckBoxchecked,
+                        this.incoming_selection_options_dialog.isStringRefs_AlsoInstrumentRegisterArithmeticCheckBoxchecked,
+                        this.incoming_selection_options_dialog.isStringRefs_StalkOtherModulesCheckBoxchecked);
 
                 JSAgentPreparer.set_whether_only_our_module_is_stalked(
                         !this.incoming_selection_options_dialog.isStringRefs_StalkOtherModulesCheckBoxchecked);
@@ -226,7 +248,9 @@ public class DragonSelectionTask extends Task {
             ArrayList<CodeUnit> codeunits_for_watchpoints= WatchpointProcessingUtils.extract_selection_as_arraylist_of_codeunits(this.current_program,code_unit_gatherer_task.address_ranges_that_are_gathered,monitor );
 
             
-            if (monitor.isCancelled())
+            //null means the extraction was cancelled, which is now distinguishable from an empty
+            //selection. Without the null check the next line would dereference it.
+            if (codeunits_for_watchpoints==null || monitor.isCancelled())
             {
                 this.is_cancelled=true;
                 monitor.cancel();
@@ -234,6 +258,14 @@ public class DragonSelectionTask extends Task {
             }
 
             JSAgentPreparer.enable_hardware_watchpoint_logging((String) this.incoming_selection_options_dialog.MaxTimesLogWatchpointsComboBox.getSelectedItem());
+
+            //restrict which threads get a watchpoint installed, same shape as the three stalker features
+            if (this.incoming_selection_options_dialog.isWatchpoints_OnlyUseThreadsWithNameCheckBoxchecked)
+            {
+                String str_that_is_included_in_threadnames=
+                        incoming_selection_options_dialog.Watchpoints_OnlyUseThreadsWithNameTextField.getText();
+                JSAgentPreparer.set_name_of_threads_for_watchpoints(str_that_is_included_in_threadnames);
+            }
             
             
             int selected_index_for_operation=this.incoming_selection_options_dialog.WatchpointTriggerOnOperationComboBox.getSelectedIndex();
@@ -314,7 +346,9 @@ public class DragonSelectionTask extends Task {
                 addresses_to_hook=CustomBacktracerUtils.extract_str_with_hook_addresses_from_selection(this.current_program,code_unit_gatherer_task.address_ranges_that_are_gathered,monitor ,should_hook_function_starts_only);
             }
                 
-            if (monitor.isCancelled())
+            //null means the extraction was cancelled, or the regex was unusable, and is now distinct from
+            //"" which means nothing matched. Without the null check the code below would NPE.
+            if (addresses_to_hook==null || monitor.isCancelled())
             {
                 this.is_cancelled=true;
                 monitor.cancel();

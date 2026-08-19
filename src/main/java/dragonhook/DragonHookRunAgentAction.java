@@ -15,6 +15,13 @@ public class DragonHookRunAgentAction extends DockingAction {
 
     protected PluginTool tool;
     protected Program current_program;
+
+    //Called by DragonHookPlugin.programActivated/programDeactivated. Without this the program captured
+    //when the action was constructed was used forever, so after switching program in Ghidra every offset
+    //and every comment went to the WRONG program's database.
+    public void set_current_program(Program incoming_program) {
+        this.current_program=incoming_program;
+    }
     protected Plugin incoming_plugin;
     protected DragonAgentRunnerTaskDispatcher agentrunner_taskdispatcher;
 
@@ -45,6 +52,13 @@ public class DragonHookRunAgentAction extends DockingAction {
 
     @Override
     public void actionPerformed(ActionContext context) {
+        //One agent at a time. There is a single static handle to the running python process, so a second run
+        //would overwrite it and the first run's cleanup would then clear it while the second was still going.
+        if (DragonAgentRunnerTask.refuse_to_start_because_an_agent_is_already_running(this.tool))
+        {
+            return;
+        }
+        DragonAgentRunnerTask.the_agent_was_force_stopped=false;   //fresh run, fresh state
         CreatorOfNecessaryFiles.createAllNecessaryFiles();
         String path_for_agent_as_str = CreatorOfNecessaryFiles.createAgentFile();
         this.current_program = (this.current_program==null) ? getCurrentProgram() : this.current_program;
